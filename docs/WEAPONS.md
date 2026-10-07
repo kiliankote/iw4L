@@ -5,8 +5,8 @@
 those operations; `configuration/{iw4,iw5,t5,t6}` own source selection rules.
 
 `WeaponFamilies` normalizes selections and checks attachments and host limits.
-Resolution and UI toggles return a private registry-issued `WeaponHandle` plus
-read-only canonical selection. Console/UI use this resolver. Publication iteration
+Frontend loadout publication defers map-selected hands admission; matches validate soldiers and skeletons. Saved class previews include unavailable captured families.
+Resolution and UI toggles return a private registry-issued `WeaponHandle` plus read-only canonical selection. Console/UI use this resolver. Publication iteration
 includes the last valid row; unarmed, unknown and unsupported remain distinct.
 
 `WeaponRegistry::bind` rejects foreign revisions before row access. Exact clones
@@ -47,4 +47,4 @@ Body/tree/script/clip replacement resets animation and preserves corpse occupati
 
 Publication compiles appearance plans once; `SelectedWeaponAppearance` binds models, overrides and UI metadata.
 Raw hand/camouflage data stays on `WeaponBuild`; runtime consumers select appearances.
-Native previews are optional; known IW4 model choices compile their own preview keys.
+The editor reopens attachments/camouflage; previews retain namespace material/image bindings and fall back to authored HUD icons. IW4 scripts bridge foreign smoke, gas, sticky, knife and C4 equipment names.

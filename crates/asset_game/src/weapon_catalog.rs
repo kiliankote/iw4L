@@ -1553,6 +1553,7 @@ pub struct WeaponRegistry {
 
     world_catalog_identity: u64,
     fpv_catalog_identity: u64,
+    loadout_only: bool,
 
     iw5_attachments: HashMap<String, Iw5ScopeRow>,
 

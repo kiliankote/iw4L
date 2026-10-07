@@ -11,6 +11,11 @@ impl WeaponCatalog {
 }
 
 impl WeaponBuild {
+    pub fn publish_for_loadout(mut self) -> WeaponRegistry {
+        self.registry.loadout_only = true;
+        self.publish()
+    }
+
     pub fn publish(self) -> WeaponRegistry {
         let mut registry = self.registry;
         registry.revision = mint_weapon_revision();
@@ -451,6 +456,7 @@ impl WeaponBuild {
             rows,
             world_catalog_identity: 0,
             fpv_catalog_identity: 0,
+            loadout_only: false,
             iw5_attachments,
             configurations: HashMap::new(),
             by_name: index_of,

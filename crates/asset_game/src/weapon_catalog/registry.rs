@@ -303,7 +303,7 @@ impl WeaponRegistry {
                 });
             }
         }
-        if row.gun_xmodel_edge.is_bound() {
+        if !self.loadout_only && row.gun_xmodel_edge.is_bound() {
             for (side, hands) in row.fpv_soldiers.iter().enumerate() {
                 if hands.as_ref().is_none_or(|hands| hands.is_err()) {
                     gaps.push(WeaponDependencyGap {
