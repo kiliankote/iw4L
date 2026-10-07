@@ -35,16 +35,16 @@ IW4 soldiers. Catalog owners must match. Unsupported family pairs refuse.
 before accepting handles and alternate links. Retained compositions validate model
 and hide identity; track mappings/rigs retain actual clips and meshes. Foreign clips
 or rig poses refuse before writes. Optional bones/clips and preparation budget remain.
-Dropped items and remote kits share demanded `ItemComposition` topology and hide
-layout, retaining registry/world owners. Required model/pose failures are cached;
+Material admission retains mesh/material owners; raw assembly construction is internal.
+Items and remote kits share `ItemComposition` topology/hide and registry/world owners. Required model/pose failures are cached;
 optional attachments and camo-to-base fallback preserve policy. Replacement clears
 successes/refusals. Kits retain body/world catalogs; `models()` accepts no catalogs.
-Prepared DObj identity controls reuse. Optional heads and separate shield policy remain.
+Prepared DObj identity controls reuse; heads use checked soldier capabilities.
 `PlayerAnimationBinding` retains the character kit/rig, paired tree/script and clips.
 Multiplayer body tracks validate leaves/tracks and soldier tree/script/clip family.
 Missing native profiles refuse; persistent trees reuse only the same binding.
 Body/tree/script/clip replacement resets animation and preserves corpse occupation; unchanged bindings preserve blend, phase and rate.
 
-GPU/media readiness uses separate match, material, FPV and audio milestones.
-BO1 camo tables and BO2 image/material recipes publish weapon-specific choices, localized captions and previews.
-Saved primary/secondary camo names resolve to material variants for first-person and player world weapons before Ready.
+Publication compiles appearance plans once; `SelectedWeaponAppearance` binds models, overrides and UI metadata.
+Raw hand/camouflage data stays on `WeaponBuild`; runtime consumers select appearances.
+Native previews are optional; known IW4 model choices compile their own preview keys.

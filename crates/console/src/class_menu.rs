@@ -42,7 +42,11 @@ fn camo_preview(catalog: &ClassLoadoutCatalog, weapon: &str, camo: &str) -> Stri
     session::resolve_class_weapon(registry, weapon, &[], asset_game::LoadoutRules::default())
         .map_or_else(
             |_| String::new(),
-            |id| registry.camouflage_preview(id, camo),
+            |id| {
+                registry
+                    .camouflage_preview(id, camo)
+                    .unwrap_or_else(String::new)
+            },
         )
 }
 

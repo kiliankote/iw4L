@@ -319,7 +319,6 @@ pub(super) async fn walk_prepared_match(
     let map_fpv_n = map_fpv.len();
     let map_fpv_added = fpv_meshes.absorb(map_fpv);
     fpv_meshes.set_map_namespace(map_namespace);
-    weapons.resolve_fpv_mesh_edges(&fpv_meshes);
 
     world_weapons.seal_identity();
     weapons.resolve_world_model_edges(&world_weapons);
@@ -601,6 +600,7 @@ pub(super) async fn walk_prepared_match(
     );
     // Bind rigs and tracks to the finished mesh publication, after material linking.
     let fpv_meshes = Arc::new(fpv_meshes.publish());
+    weapons.resolve_fpv_mesh_edges(&fpv_meshes);
     let bodies = Arc::new(bodies.publish());
     let xanims = Arc::new(xanims.publish());
     let soldiers = asset_game::SoldierPresentations::prepare(
