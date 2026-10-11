@@ -172,7 +172,12 @@ impl WeaponRegistry {
                         && table.name.eq_ignore_ascii_case("mp/perkTable.csv")
                         && table.lookup_row_in_col(1, name).is_some()
                 });
-            return if native_perk {
+            let native_weapon = infinity
+                && self
+                    .families
+                    .find(&crate::FamilyKey::new(namespace, name))
+                    .is_some();
+            return if native_perk || native_weapon {
                 Ok(Default::default())
             } else {
                 Err("unlock.missing_item")
@@ -231,17 +236,7 @@ impl WeaponRegistry {
             .describe_configuration(id)
             .ok_or("unlock.missing_family")?;
         let family = selection.family.as_ref().ok_or("unlock.missing_family")?;
-        match self.item_unlock_requirement(family.namespace, &family.base) {
-            Err("unlock.missing_item")
-                if matches!(
-                    family.namespace,
-                    crate::AssetNamespace::Iw4 | crate::AssetNamespace::Iw5
-                ) =>
-            {
-                Ok(Default::default())
-            }
-            requirement => requirement,
-        }
+        self.item_unlock_requirement(family.namespace, &family.base)
     }
 
     pub fn vehicle_compass(&self) -> impl Iterator<Item = (&str, &[String; 2], [i32; 2])> {

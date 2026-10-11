@@ -61,20 +61,11 @@ fn send_text(
         .position(|b| *b == 0)
         .unwrap_or(meta.name.len());
     let name = clean(&String::from_utf8_lossy(&meta.name[..end]));
-    let state = match meta.lifecycle {
-        ClientLifecycle::Spectating => "(Spectator) ",
-        ClientLifecycle::Dead | ClientLifecycle::RespawnPending => "(Dead) ",
-        _ => "",
-    };
     let text = clean(text);
     if text.trim().is_empty() {
         return false;
     }
-    let channel = if team_only { "(Team) " } else { "" };
-    let line = format!(
-        "{state}{channel}{name}{}: {text}",
-        crate::HUD_PRINT_ARG_SEPARATOR
-    );
+    let line = format!("{name}{}: {text}", crate::HUD_PRINT_ARG_SEPARATOR);
     let dead_chat = world
         .ecs()
         .get_resource::<crate::script::MatchScript>()

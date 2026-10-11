@@ -48,11 +48,13 @@ A hand-typed `quit`/`exit`/`disconnect` goes further: it jumps **every** hold,
 `wait 60s` included, and releases it. A `quit` written into `--cmds` does not —
 it is part of the script and waits its turn.
 
-Public chat is **T**, team chat is **Y**. Controls → Actions can rebind both;
+Public chat is **T**, team chat is **Y**. Multiplayer settings and Controls →
+Actions can rebind both;
 `bind T chatmodepublic` / `bind Y chatmodeteam` also persist. Enter sends,
 Escape cancels; arrows, Home/End, Backspace/Delete edit the message.
 `say <message>` and `say_team <message>` send from the console. Chat lasts
-eight seconds, shows five recent messages, and uses team colors for names.
+eight seconds, shows five recent messages, and uses team colors for names with white
+message text. Lines contain only `nickname: message`, without status prefixes.
 
 ## Verbs and traps
 
