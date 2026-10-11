@@ -30,6 +30,9 @@ impl UiMenuDvars {
     }
 }
 
+#[derive(Resource, Default, Debug)]
+pub struct FrontendContentLoading;
+
 #[derive(Resource, Clone, Default, Debug)]
 pub struct HostMatchRules(pub Vec<(String, String)>);
 
@@ -41,6 +44,7 @@ pub struct UiExecCommand {
 #[derive(Message, Clone, Debug, PartialEq, Eq)]
 pub enum UiMenuRequest {
     Toggle,
+    RestoreLobby,
     Open(String),
     Close(String),
     Focus { menu: String, item: String },

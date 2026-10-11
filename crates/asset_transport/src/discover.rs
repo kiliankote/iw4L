@@ -250,9 +250,6 @@ fn game_files(root: &Path) -> impl Iterator<Item = Result<PathBuf, String>> {
     files_under(search_roots(root))
 }
 
-/// Folders the game never keeps zones in: cargo's output when the games root is the build's own
-/// `target/play` (tens of thousands of files, walked on every discovery), and our own
-/// artifacts.
 const NOT_GAME_DIRS: [&str; 6] = [
     "incremental",
     "deps",

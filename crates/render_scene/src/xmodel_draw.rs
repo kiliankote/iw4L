@@ -56,19 +56,18 @@ impl XModelCasterBound {
     }
 }
 
-/// The volumes each sun partition collects its casters from this frame, published before the
-/// models are posed (empty while sun shadows are off). A model the camera does not see still
-/// shades what it does see while its bound is inside one of them, as IW4 culls scene entities
-/// for each sun partition apart from the camera.
 #[derive(Resource, Clone, Debug, Default, PartialEq)]
-pub struct SunShadowCasterVolume {
-    pub partitions: Vec<Vec<[f32; 4]>>,
-}
+pub struct PreparedSunShadowFrame(pub Option<render_frame::SunShadowForcedFrame>);
 
-impl SunShadowCasterVolume {
+impl PreparedSunShadowFrame {
     #[must_use]
     pub fn admits(&self, bound: XModelCasterBound) -> bool {
-        self.partitions.iter().any(|planes| !bound.outside(planes))
+        self.0.as_ref().is_some_and(|frame| {
+            frame
+                .partitions
+                .iter()
+                .any(|partition| !bound.outside(partition.clip_planes.as_slice()))
+        })
     }
 }
 

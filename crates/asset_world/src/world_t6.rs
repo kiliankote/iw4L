@@ -1022,9 +1022,24 @@ pub fn model_mesh(skel: asset_model::ModelSkel) -> Result<crate::ModelMesh, Stri
             Mesh::ATTRIBUTE_POSITION,
             skel.positions[first..end].to_vec(),
         );
-        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, skel.normals[first..end].to_vec());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, skel.colors[first..end].to_vec());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, skel.uvs[first..end].to_vec());
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_NORMAL,
+            skel.normals()
+                .skip(first)
+                .take(end - first)
+                .collect::<Vec<_>>(),
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_COLOR,
+            skel.colors()
+                .skip(first)
+                .take(end - first)
+                .collect::<Vec<_>>(),
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_UV_0,
+            skel.uvs().skip(first).take(end - first).collect::<Vec<_>>(),
+        );
         mesh.insert_indices(Indices::U32(indices));
         surfaces.push(crate::model_mesh::ModelSurfaceDraw {
             mesh,

@@ -96,8 +96,6 @@ pub struct SmodelGpuPlan {
 
     pub unlit_material_key: std::collections::HashMap<Option<assets::MaterialIndex>, u32>,
 
-    /// Shadow-caster surfaces (a tree's shadow mesh): drawn into the shadow maps only, so kept
-    /// out of the colour keys above.
     pub shadow_material_key: std::collections::HashMap<Option<assets::MaterialIndex>, u32>,
     pub upload_pending: bool,
     pub packed_share: Option<Arc<Vec<[u8; asset_iw4::size::GFX_PACKED_VERTEX]>>>,
@@ -494,9 +492,6 @@ pub fn expand_smodel_cached_vertices(
     plan.cached_skip_n = 0;
 }
 
-/// Lists a shadow-caster surface's material for the shadow passes, and says whether it was one.
-/// MW2 trees cast their sun shadow through such a surface alone, so dropping it with the colour
-/// pass left them shadowless (only the lightmap's blocky shadow under them stayed).
 fn register_shadow_only_material(
     plan: &mut SmodelGpuPlan,
     authored: Option<assets::MaterialIndex>,

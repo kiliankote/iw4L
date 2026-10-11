@@ -76,7 +76,7 @@ struct ScriptModelPoseLocals<'w, 's> {
     remap: Local<'s, Vec<Option<usize>>>,
     lod_skinned: Res<'w, render_scene::LodRampSkinnedDvar>,
     gfx_scene: Res<'w, HostGfxScene>,
-    sun_casters: Res<'w, render_scene::SunShadowCasterVolume>,
+    sun_casters: Res<'w, render_scene::PreparedSunShadowFrame>,
 }
 
 #[derive(SystemParam)]
@@ -636,9 +636,6 @@ fn pose_script_models(
         let entnum = owner.gentity_number.map(u32::from);
 
         let slot = entnum.map(|entnum| script_scene_slot(&gfx_scene.scene, entnum));
-        // Out of the camera's walk, a model can still shade what the camera sees (laundry
-        // above the view on the wall below it): it stays, for the sun shadow only, while it is
-        // inside a sun partition.
         let walk_hidden = entnum.is_some_and(|entnum| gfx_scene.scene.scene_ent_hidden(entnum));
         if let Some(why) = slot.as_ref().and_then(|slot| slot.skip)
             && !walk_hidden

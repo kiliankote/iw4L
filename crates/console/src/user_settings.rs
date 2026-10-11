@@ -152,20 +152,17 @@ pub(crate) fn consume_menu_binding(
 
 pub(crate) fn sync_binding_view(
     binds: Res<KeyBinds>,
-    devices: Res<frame::InputDevices>,
     mut view: ResMut<ui::BindingView>,
     mut dvars: ResMut<frame::UiMenuDvars>,
-    mut style: Local<Option<frame::PromptStyle>>,
 ) {
-    if !binds.is_changed() && *style == Some(devices.style) {
+    if !binds.is_changed() {
         return;
     }
-    *style = Some(devices.style);
     let mut chords = std::collections::BTreeMap::<u32, (Vec<String>, Vec<String>)>::new();
     for (button, id) in binds.iter() {
         let (keys, buttons) = chords.entry(id).or_default();
         match button {
-            BindButton::Pad(pad) => buttons.push(pad.prompt(devices.style).to_owned()),
+            BindButton::Pad(pad) => buttons.push(pad.icon_prompt().to_owned()),
             _ => keys.push(display_button(button)),
         }
     }

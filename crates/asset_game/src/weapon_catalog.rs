@@ -1329,6 +1329,7 @@ pub struct T6AttachmentModel {
 struct WeaponRow {
     preparation: WeaponPreparationRecipe,
     name: String,
+    native_script_name: String,
     alternate_weapon: Option<String>,
     impact_payload: Option<String>,
     alternate_index: u32,
@@ -1469,6 +1470,7 @@ impl Default for WeaponRow {
         Self {
             preparation: WeaponPreparationRecipe::native(crate::AssetNamespace::Iw4),
             name: String::new(),
+            native_script_name: String::new(),
             alternate_weapon: None,
             impact_payload: None,
             alternate_index: 0,

@@ -1469,7 +1469,7 @@ impl AssetLinkSink for CommonWalkSink {
                     geometry,
                     Some(&self.materials),
                 )
-                .map(std::sync::Arc::new);
+                .map(|skel| self.shared_surfaces.share_geometry(skel));
                 if let Some(skel) = &skel {
                     self.shared_surfaces.retain(stream, geometry, skel.clone());
                     self.fx_models.capture_shared(skel.clone(), &self.materials);

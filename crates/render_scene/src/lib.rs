@@ -13,7 +13,9 @@ pub mod view_parms;
 pub mod world_instances;
 pub mod xmodel_draw;
 
-pub use camera::{FlyCamera, FpvLens, SimCamera, WorldCameraPose, transform_from_iw_view};
+pub use camera::{
+    CameraView, FlyCamera, FpvLens, SimCamera, WorldCameraPose, transform_from_iw_view,
+};
 pub use dpvs_cells::{DynEntModelEntity, PublishedCellVis, WorldDpvsCells};
 pub use dyn_atpoint::DynAtPointLookup;
 pub use frustum::{FrustumSpec, clip_from_world_frustum_planes, perspective_frustum_planes};
@@ -53,5 +55,5 @@ pub use view_parms::{
 };
 pub use world_instances::{WorldDynEntInstance, WorldScriptModelInstance};
 pub use xmodel_draw::{
-    SunShadowCasterVolume, XModelCasterBound, XModelColourRefusal, XModelSurfaceDraw,
+    PreparedSunShadowFrame, XModelCasterBound, XModelColourRefusal, XModelSurfaceDraw,
 };

@@ -13,6 +13,7 @@ pub struct RenderScenePlugin;
 impl Plugin for RenderScenePlugin {
     fn build(&self, app: &mut App) {
         app.scoped::<HostGfxScene>(frame::MatchScope::Live)
+            .scoped::<crate::PreparedSunShadowFrame>(frame::MatchScope::Live)
             .scoped::<crate::ModelLightingAtlasTileWrites>(frame::MatchScope::Live)
             .scoped::<DynAtPointLookup>(frame::MatchScope::Live)
             .scoped::<crate::WorldDpvsCells>(frame::MatchScope::Live)
@@ -33,7 +34,6 @@ impl Plugin for RenderScenePlugin {
             .init_resource::<RSubwindowDvar>()
             .init_resource::<RLockPvs>()
             .init_resource::<SmEnableDvar>()
-            .init_resource::<SmSunEnableDvar>()
-            .init_resource::<crate::SunShadowCasterVolume>();
+            .init_resource::<SmSunEnableDvar>();
     }
 }

@@ -1,3 +1,5 @@
+use bevy::prelude::DetectChangesMut;
+
 pub use super::sun_shadow_clip::{
     SunShadowClipInput, SunShadowFrustumRays, sun_shadow_clip_planes, sun_shadow_frustum_rays,
 };
@@ -554,9 +556,6 @@ pub fn forced_fallback_frame(
     }
 }
 
-/// The sun frame for the prepared view. The command context builds the frame with it, and so
-/// does the caster volume published before the models are posed, so both see the same
-/// partitions.
 pub fn sun_shadow_frame_for_view(
     light_direction: [f32; 3],
     prepared: &crate::prepare::scene::view_parms::PreparedSceneView,
@@ -583,30 +582,35 @@ pub fn sun_shadow_frame_for_view(
     )
 }
 
-/// Publishes this frame's sun caster volumes (see [`render_scene::SunShadowCasterVolume`])
-/// from the inputs the command context builds the sun frame from.
-pub(crate) fn publish_sun_shadow_caster_volume(
+pub(crate) fn publish_sun_shadow_frame(
     dir_light: Option<bevy::prelude::Res<crate::prepare::scene::world::MapDirPrimaryLight>>,
     prepared: bevy::prelude::Res<crate::prepare::scene::view_parms::PreparedSceneView>,
     scene: Option<bevy::prelude::Res<crate::prepare::scene::world::WorldScene>>,
-    mut volume: bevy::prelude::ResMut<render_scene::SunShadowCasterVolume>,
+    shadows: bevy::prelude::Res<render_scene::SmEnableDvar>,
+    sun_shadows: bevy::prelude::Res<render_scene::SmSunEnableDvar>,
+    mut published: bevy::prelude::ResMut<render_scene::PreparedSunShadowFrame>,
 ) {
-    let scene = scene.as_deref();
-    let partitions = match (
-        dir_light.as_deref(),
-        scene.and_then(|scene| scene.world_bounds),
-    ) {
-        (Some(light), Some(bounds)) if prepared.ready => {
-            let sample_near = scene.map_or(0.25, |scene| scene.sun_sample_size_near);
-            sun_shadow_frame_for_view(light.direction, &prepared, bounds, sample_near)
-                .partitions
-                .iter()
-                .map(|partition| partition.clip_planes.as_slice().to_vec())
-                .collect()
-        }
-        _ => Vec::new(),
+    let enabled = prepared.ready
+        && shadows.enabled.unwrap_or(lighting_iw4::SM_ENABLE_DEFAULT)
+        && sun_shadows
+            .enabled
+            .unwrap_or(lighting_iw4::SM_SUN_ENABLE_DEFAULT);
+    let next = if enabled {
+        dir_light
+            .as_deref()
+            .zip(scene.as_deref())
+            .and_then(|(light, scene)| {
+                scene.world_bounds.map(|bounds| {
+                    sun_shadow_frame_for_view(
+                        light.direction,
+                        &prepared,
+                        bounds,
+                        scene.sun_sample_size_near,
+                    )
+                })
+            })
+    } else {
+        None
     };
-    if volume.partitions != partitions {
-        volume.partitions = partitions;
-    }
+    published.set_if_neq(render_scene::PreparedSunShadowFrame(next));
 }

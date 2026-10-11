@@ -231,7 +231,17 @@ impl WeaponRegistry {
             .describe_configuration(id)
             .ok_or("unlock.missing_family")?;
         let family = selection.family.as_ref().ok_or("unlock.missing_family")?;
-        self.item_unlock_requirement(family.namespace, &family.base)
+        match self.item_unlock_requirement(family.namespace, &family.base) {
+            Err("unlock.missing_item")
+                if matches!(
+                    family.namespace,
+                    crate::AssetNamespace::Iw4 | crate::AssetNamespace::Iw5
+                ) =>
+            {
+                Ok(Default::default())
+            }
+            requirement => requirement,
+        }
     }
 
     pub fn vehicle_compass(&self) -> impl Iterator<Item = (&str, &[String; 2], [i32; 2])> {
@@ -918,6 +928,18 @@ impl WeaponRegistry {
 
     pub fn script_name_of(&self, index: u32) -> String {
         gsc_weapon_script_name(self.name_of(index))
+    }
+
+    pub fn native_script_aliases(&self) -> impl Iterator<Item = (String, u32)> + '_ {
+        self.rows
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(id, row)| {
+                (normalize_weapon_name(&row.native_script_name) == row.name
+                    && row.native_script_name != gsc_weapon_script_name(&row.name))
+                .then(|| (row.native_script_name.clone(), id as u32))
+            })
     }
 
     pub fn configuration_supported(&self, id: u32) -> bool {

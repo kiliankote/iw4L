@@ -8,7 +8,10 @@ use state::OpenMenu;
 pub use state::ScriptMenus;
 
 #[derive(bevy::prelude::Resource, Default)]
-pub struct FrontendMenus(pub ScriptMenus);
+pub struct FrontendMenus {
+    menus: ScriptMenus,
+    restore_lobby: bool,
+}
 
 #[derive(bevy::ecs::system::SystemParam)]
 pub struct MenuState<'w> {
@@ -19,7 +22,7 @@ impl MenuState<'_> {
     pub fn as_ref(&self) -> Option<&ScriptMenus> {
         self.scoped
             .as_deref()
-            .or_else(|| self.frontend.as_deref().map(|menus| &menus.0))
+            .or_else(|| self.frontend.as_deref().map(|menus| &menus.menus))
     }
     pub fn as_deref(&self) -> Option<&ScriptMenus> {
         self.as_ref()
@@ -65,6 +68,7 @@ pub(super) const MAX_SCRIPT_DEPTH: u32 = 16;
 const MAIN_MENU_DVAR: &str = "g_scriptMainMenu";
 const FALLBACK_MAIN_MENU: &str = "class";
 const SCOREBOARD_MENU: &str = "scoreboard";
+const FRONTEND_LOADING_MENU: &str = "iw4l_frontend_loading";
 
 pub(super) fn is_focusable(item: &asset_game::MenuItem) -> bool {
     if item.static_flags & WINDOW_DECORATION != 0 {
@@ -180,6 +184,7 @@ pub(crate) fn spawn_script_menus(root: &mut ChildSpawnerCommands) {
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct MenuInputs<'w, 's> {
     keys: Res<'w, ButtonInput<KeyCode>>,
+    overlay: Res<'w, frame::UiOverlayInput>,
     keyboard: MessageReader<'w, 's, bevy::input::keyboard::KeyboardInput>,
     mouse: Res<'w, ButtonInput<MouseButton>>,
     windows: Query<'w, 's, &'static Window, With<bevy::window::PrimaryWindow>>,
@@ -193,6 +198,7 @@ pub(crate) struct MenuInputs<'w, 's> {
     party: Res<'w, frame::UiPartyState>,
     frontend_strings: Option<Res<'w, asset_game::LocalizeCatalog>>,
     player_data: Option<Res<'w, sim::LocalPlayerData>>,
+    content_loading: Option<Res<'w, frame::FrontendContentLoading>>,
 }
 
 #[derive(Default)]
@@ -245,7 +251,19 @@ pub(crate) fn update_script_menus(
     mut images: ResMut<Assets<Image>>,
     mut pass: ResMut<HudTessPass>,
 ) {
-    let mut menus = menu_states.0.as_deref_mut().unwrap_or(&mut menu_states.1.0);
+    let requests: Vec<UiMenuRequest> = input.requests.read().cloned().collect();
+    let FrontendMenus {
+        menus: frontend_menus,
+        restore_lobby,
+    } = &mut *menu_states.1;
+    for request in &requests {
+        match request {
+            UiMenuRequest::RestoreLobby => *restore_lobby = true,
+            UiMenuRequest::Close(name) if name == "game_lobby" => *restore_lobby = false,
+            _ => {}
+        }
+    }
+    let mut menus = menu_states.0.as_deref_mut().unwrap_or(frontend_menus);
     let mut locals = local_states
         .0
         .as_deref_mut()
@@ -258,7 +276,6 @@ pub(crate) fn update_script_menus(
         out.binding.command = None;
         *menus = ScriptMenus::default();
     }
-    let requests: Vec<UiMenuRequest> = input.requests.read().cloned().collect();
     let Some(catalog) = catalog.as_deref() else {
         return;
     };
@@ -342,14 +359,41 @@ pub(crate) fn update_script_menus(
         binding: &mut out.binding,
     };
 
+    let main_menu = if frontend && input.content_loading.is_some() {
+        FRONTEND_LOADING_MENU
+    } else {
+        "iw4l_main"
+    };
+    if frontend
+        && main_menu == "iw4l_main"
+        && let Some(at) = runner.menus.position(FRONTEND_LOADING_MENU)
+    {
+        let above: Vec<String> = runner.menus.stack[at + 1..]
+            .iter()
+            .map(|open| open.name.clone())
+            .collect();
+        runner.close(FRONTEND_LOADING_MENU);
+        runner.open(main_menu);
+        for name in above {
+            runner.open(&name);
+        }
+    }
     if frontend && screen_changed {
-        runner.open("iw4l_main");
+        runner.open(main_menu);
         if let Some(def) = catalog.get("main")
             && !def.sound_name.is_empty()
         {
             out.music.write(frame::UiPlayMusic {
                 alias: def.sound_name.clone(),
             });
+        }
+    }
+
+    if frontend && main_menu == "iw4l_main" && *restore_lobby {
+        *restore_lobby = false;
+        if input.party.in_lobby && input.party.is_host {
+            runner.open("game_lobby");
+            diag::info!(Ui, "frontend: private lobby reopened");
         }
     }
 
@@ -378,6 +422,7 @@ pub(crate) fn update_script_menus(
     for request in requests {
         match request {
             UiMenuRequest::Toggle => pressed.escape = true,
+            UiMenuRequest::RestoreLobby => {}
             UiMenuRequest::Open(name) => runner.open(&name),
             UiMenuRequest::Close(name) => runner.close(&name),
             UiMenuRequest::Focus { menu, item } => {
@@ -411,7 +456,7 @@ pub(crate) fn update_script_menus(
     if frontend && runner.dvars.get("ui_map_error") == Some("1") {
         runner.open("iw4l_map_error");
     }
-    let pointer = !console_open;
+    let pointer = !console_open && !input.overlay.0;
     if pointer {
         let keys = &input.keys;
         pressed.escape |= keys.just_pressed(KeyCode::Escape);
@@ -451,6 +496,10 @@ pub(crate) fn update_script_menus(
         if view.script_menu_open != open {
             view.script_menu_open = open;
         }
+    }
+
+    if input.overlay.0 && in_game {
+        return;
     }
 
     let scoreboard = snapshot

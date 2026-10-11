@@ -57,6 +57,18 @@ impl Plugin for MenuPlugin {
 
 pub fn install_frontend_menus(catalog: &mut asset_game::MenuCatalog) -> Result<(), String> {
     catalog.load_definitions(include_str!("../menus/frontend.json"))?;
+    if let Some(mut backdrop) = catalog.get("iw4l_main").cloned() {
+        backdrop.name = "iw4l_theater_background".into();
+        backdrop.static_flags = 0x0010_0000;
+        backdrop.handlers = Default::default();
+        backdrop.items.retain(|item| {
+            matches!(
+                item.name.as_str(),
+                "background" | "clouds" | "soldier" | "glow"
+            )
+        });
+        catalog.menus.insert(backdrop.name.clone(), backdrop);
+    }
     catalog.load_definitions(include_str!("../menus/connection_error.json"))?;
     catalog.load_definitions(include_str!("../menus/map_error.json"))?;
     catalog.load_definitions(include_str!("../menus/classes.json"))?;
