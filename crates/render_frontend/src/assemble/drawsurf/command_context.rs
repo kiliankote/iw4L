@@ -618,27 +618,10 @@ pub(crate) fn update_command_context_code_sources(
         if let Some(scene) = scene.as_deref()
             && let Some(bounds) = scene.world_bounds
         {
-            let world_mid = [bounds[0], bounds[1], bounds[2]];
-            let world_half = [bounds[3], bounds[4], bounds[5]];
-            let shadow_forward = super::sun_shadow_forward_from_light_dir(light.direction);
-            let world = prepared.view_from_world.inverse();
-            let forward = world.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
-            let right = world.transform_vector3(Vec3::X).normalize_or_zero();
-            let up = world.transform_vector3(Vec3::Y).normalize_or_zero();
-            let (tx, ty) = super::tan_half_fov_from_clip(clip_from_view);
-            let frame = super::forced_fallback_frame(
-                shadow_forward,
-                super::SunShadowCamera {
-                    origin: eye.to_array(),
-                    forward: forward.to_array(),
-                    right: right.to_array(),
-                    up: up.to_array(),
-                    tan_half_fov_x: tx,
-                    tan_half_fov_y: ty,
-                    z_near: prepared.near,
-                },
-                world_mid,
-                world_half,
+            let frame = super::sun_shadow_frame_for_view(
+                light.direction,
+                &prepared,
+                bounds,
                 scene.sun_sample_size_near,
             );
             produce_sun_shadow_receiver_constants(&mut mat_frame.code_sources, frame);

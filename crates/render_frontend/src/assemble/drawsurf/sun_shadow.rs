@@ -553,3 +553,60 @@ pub fn forced_fallback_frame(
         projection_offset_clip,
     }
 }
+
+/// The sun frame for the prepared view. The command context builds the frame with it, and so
+/// does the caster volume published before the models are posed, so both see the same
+/// partitions.
+pub fn sun_shadow_frame_for_view(
+    light_direction: [f32; 3],
+    prepared: &crate::prepare::scene::view_parms::PreparedSceneView,
+    world_bounds: [f32; 6],
+    sample_near: f32,
+) -> SunShadowForcedFrame {
+    let world = prepared.view_from_world.inverse();
+    let axis = |local: bevy::math::Vec3| world.transform_vector3(local).normalize_or_zero();
+    let (tan_half_fov_x, tan_half_fov_y) = tan_half_fov_from_clip(prepared.clip_from_view);
+    forced_fallback_frame(
+        sun_shadow_forward_from_light_dir(light_direction),
+        SunShadowCamera {
+            origin: prepared.eye.to_array(),
+            forward: axis(bevy::math::Vec3::NEG_Z).to_array(),
+            right: axis(bevy::math::Vec3::X).to_array(),
+            up: axis(bevy::math::Vec3::Y).to_array(),
+            tan_half_fov_x,
+            tan_half_fov_y,
+            z_near: prepared.near,
+        },
+        [world_bounds[0], world_bounds[1], world_bounds[2]],
+        [world_bounds[3], world_bounds[4], world_bounds[5]],
+        sample_near,
+    )
+}
+
+/// Publishes this frame's sun caster volumes (see [`render_scene::SunShadowCasterVolume`])
+/// from the inputs the command context builds the sun frame from.
+pub(crate) fn publish_sun_shadow_caster_volume(
+    dir_light: Option<bevy::prelude::Res<crate::prepare::scene::world::MapDirPrimaryLight>>,
+    prepared: bevy::prelude::Res<crate::prepare::scene::view_parms::PreparedSceneView>,
+    scene: Option<bevy::prelude::Res<crate::prepare::scene::world::WorldScene>>,
+    mut volume: bevy::prelude::ResMut<render_scene::SunShadowCasterVolume>,
+) {
+    let scene = scene.as_deref();
+    let partitions = match (
+        dir_light.as_deref(),
+        scene.and_then(|scene| scene.world_bounds),
+    ) {
+        (Some(light), Some(bounds)) if prepared.ready => {
+            let sample_near = scene.map_or(0.25, |scene| scene.sun_sample_size_near);
+            sun_shadow_frame_for_view(light.direction, &prepared, bounds, sample_near)
+                .partitions
+                .iter()
+                .map(|partition| partition.clip_planes.as_slice().to_vec())
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    if volume.partitions != partitions {
+        volume.partitions = partitions;
+    }
+}
