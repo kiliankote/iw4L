@@ -974,6 +974,24 @@ pub fn static_model_vertex_lighting(
         .collect()
 }
 
+pub fn static_model_lighting_palette(
+    load: &ZoneLoad,
+    world: &LoadedAsset,
+) -> Result<Vec<u16>, String> {
+    let r = Reader(load);
+    let count = Reader::word(&world.header, 784)?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = Reader::ptr(&world.header, 876)?;
+    (0..count)
+        .map(|i| {
+            let bytes = r.bytes(rows.at(i * 152 + 70), 2)?;
+            Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+        })
+        .collect()
+}
+
 pub fn static_model_lighting_origins(
     load: &ZoneLoad,
     world: &LoadedAsset,

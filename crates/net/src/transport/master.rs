@@ -31,6 +31,9 @@ use crate::transport::fragment::{Fragmenter, Reassembler};
 use crate::transport::protocol::{ContentFingerprint, HandshakeHello, MatchDescriptor};
 use crate::transport::udp_session::{RelayMailbox, UdpAuthorityHub, UdpClientLink};
 
+mod population;
+pub use population::CommunityPlayerCounts;
+
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
@@ -546,6 +549,7 @@ pub enum MasterBridgeState {
         max_players: u8,
         skip_votes: u8,
         in_match: bool,
+        families: frame::AssetFamilies,
     },
     Joining {
         identity: SessionIdentity,
@@ -560,6 +564,7 @@ pub enum MasterBridgeState {
         max_players: u8,
         skip_votes: u8,
         in_match: bool,
+        families: frame::AssetFamilies,
     },
     Closed {
         identity: SessionIdentity,
@@ -597,6 +602,13 @@ impl MasterBridgeState {
     pub fn mode(&self) -> Option<&str> {
         match self {
             Self::Hosting { mode, .. } | Self::Joined { mode, .. } => Some(mode),
+            _ => None,
+        }
+    }
+
+    pub fn families(&self) -> Option<frame::AssetFamilies> {
+        match self {
+            Self::Hosting { families, .. } | Self::Joined { families, .. } => Some(*families),
             _ => None,
         }
     }
@@ -761,6 +773,7 @@ pub struct MasterMatchOffer {
     pub map: String,
     pub mode: String,
     pub match_key: frame::MatchKey,
+    pub families: frame::AssetFamilies,
 }
 
 impl MasterMatchStart {
@@ -895,6 +908,7 @@ fn arm_master_browser(
 }
 
 fn apply_master_menu_action(
+    dvars: Res<frame::UiMenuDvars>,
     mut pending: ResMut<PendingMasterMenuAction>,
     mut intent: ResMut<MasterLaunchIntent>,
     mut role: ResMut<frame::RuntimeRole>,
@@ -921,6 +935,12 @@ fn apply_master_menu_action(
         }
         MasterMenuAction::UpdateLobby { map, mode } => {
             if let Some(bridge) = bridge {
+                if let Some(families) = bridge.state().families()
+                    && let Err(error) = families.require_map(&map)
+                {
+                    diag::warn!(Net, "{error}");
+                    return;
+                }
                 bridge.send(MasterBridgeCommand::UpdateLobby { map, mode });
             } else {
                 diag::warn!(Net, "master lobby update requested without a live bridge");
@@ -929,6 +949,12 @@ fn apply_master_menu_action(
         }
         MasterMenuAction::StartMatch { map, mode } => {
             if let Some(bridge) = bridge {
+                if let Some(families) = bridge.state().families()
+                    && let Err(error) = families.require_map(&map)
+                {
+                    diag::warn!(Net, "{error}");
+                    return;
+                }
                 bridge.send(MasterBridgeCommand::StartMatch { map, mode });
             } else {
                 diag::warn!(Net, "master lobby start requested without a live bridge");
@@ -986,7 +1012,11 @@ fn apply_master_menu_action(
             mode,
             password,
         } => {
-            let requires = match content_required_by_map(&map) {
+            let requires = match frame::AssetFamilies::from_inventory(browser.have.0, &dvars)
+                .and_then(|families| {
+                    families.require_map(&map)?;
+                    Ok(ContentFlags(families.0))
+                }) {
                 Ok(value) => value,
                 Err(error) => {
                     diag::warn!(Net, "master host content: {error}");
@@ -1320,6 +1350,10 @@ pub fn register_master_bridge(app: &mut App) {
     app.init_resource::<PendingMasterMenuAction>()
         .add_systems(
             Update,
+            population::poll_communities.in_set(crate::ClientSet::Load),
+        )
+        .add_systems(
+            Update,
             (arm_master_browser, apply_master_menu_action)
                 .chain()
                 .in_set(crate::ClientSet::Load),
@@ -1435,6 +1469,7 @@ fn observe_master_bridge(
             map: map.to_owned(),
             mode: mode.to_owned(),
             match_key: identity.match_key(),
+            families: current.families().expect("live room asset families"),
         });
         *seen_start = Some((identity.room_id, identity.epoch));
     }
@@ -2108,6 +2143,7 @@ fn publish_room_view(
             max_players: view.max_players,
             skip_votes,
             in_match,
+            families: frame::AssetFamilies(view.requires.0),
         };
         return;
     }
@@ -2122,6 +2158,7 @@ fn publish_room_view(
             max_players: view.max_players,
             skip_votes,
             in_match,
+            families: frame::AssetFamilies(view.requires.0),
         };
     } else {
         *current = MasterBridgeState::Joining { identity };
@@ -2461,11 +2498,20 @@ fn handle_frame(
                 | ResponseBody::RoomJoined { member_id, view } => (view, member_id),
                 ResponseBody::RoomUpdated { view } => (view, identity.member_id),
                 ResponseBody::Error(error) => {
-                    return Err(TransportFault::new("control_rpc", role, error.to_string()));
+                    let message = match &error {
+                        master_protocol::ServiceError::MissingContent { requires, have } => {
+                            frame::AssetFamilies(requires.0)
+                                .missing_notice(have.0)
+                                .unwrap_or_else(|| error.to_string())
+                        }
+                        _ => error.to_string(),
+                    };
+                    return Err(TransportFault::new("control_rpc", role, message));
                 }
                 ResponseBody::RoomLeft
                 | ResponseBody::Ack
                 | ResponseBody::Status(_)
+                | ResponseBody::Population { .. }
                 | ResponseBody::RoomList { .. } => return Ok(()),
             };
             apply_room_view(

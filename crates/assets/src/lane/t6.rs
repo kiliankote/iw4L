@@ -2378,13 +2378,42 @@ impl ZoneLane for T6Lane {
                 .map_err(|e| report.push(format!("T6 light grid: {e}")))
                 .ok();
             let mut smodel_lighting_samples = match &light_grid {
-                Some(grid) => super::helpers::smodel_lighting_samples(
-                    &mut report,
-                    grid,
-                    asset_world::world_t6::static_model_lighting_origins(&load, world_asset)?,
-                    &static_model_instances,
-                    Some(&collision),
-                ),
+                Some(grid) => {
+                    let palette =
+                        asset_world::world_t6::static_model_lighting_palette(&load, world_asset)?;
+                    let origins =
+                        asset_world::world_t6::static_model_lighting_origins(&load, world_asset)?;
+                    let mut authored = Vec::new();
+                    let mut unresolved = Vec::new();
+                    for (slot, origin) in origins {
+                        if static_model_instances.get(slot).is_none_or(Option::is_none) {
+                            continue;
+                        }
+                        match asset_model::model_lighting::t6_smodel_palette_lighting(
+                            &grid.view(),
+                            palette[slot],
+                            slot,
+                            origin,
+                        ) {
+                            Some(sample) => authored.push(sample),
+                            None => unresolved.push((slot, origin)),
+                        }
+                    }
+                    report.push(format!(
+                        "T6 authored static model lighting: {} placements, {} spatial samples",
+                        authored.len(),
+                        unresolved.len()
+                    ));
+                    authored.extend(super::helpers::smodel_lighting_samples(
+                        &mut report,
+                        grid,
+                        unresolved,
+                        &static_model_instances,
+                        Some(&collision),
+                    ));
+                    authored.sort_unstable_by_key(|sample| sample.authored_slot);
+                    authored
+                }
                 None => Vec::new(),
             };
             let mut vertex_lighting =

@@ -18,8 +18,9 @@ scenario`, `chaos`, `bench` ([`BENCH.md`](BENCH.md)), `bench-live`, `lifecycle-*
 
 Linux startup creates `iw4`, `iw5`, `t5` and `t6` symlinks in `IW4L_GAMES` for missing games with exactly one valid Steam installation. Existing entries are preserved.
 
-`menu` opens on a Loading assets screen while the shared weapon catalog is
-prepared; the main menu replaces it with every entry available. In `--cmds`,
+`menu` opens the main menu immediately while the shared weapon catalog prepares
+in the background. Opening Classes before it is ready shows Loading Classes;
+Escape returns to the menu, and readiness opens the editor for unlocked accounts. In `--cmds`,
 `wait progression` holds until then.
 
 **Cheats are on by default.** The host accepts the debug

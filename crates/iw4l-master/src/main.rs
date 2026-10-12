@@ -119,6 +119,7 @@ struct ClientTarget {
 }
 
 struct Peer {
+    online: Option<Instant>,
     player_name: String,
     connection: quinn::Connection,
     control_tx: tokio::sync::mpsc::Sender<ControlFrame>,
@@ -188,6 +189,7 @@ impl ServiceState {
         self.peers.insert(
             connection_id,
             Peer {
+                online: None,
                 player_name,
                 connection,
                 control_tx,
@@ -800,6 +802,27 @@ async fn handle_request(
     let mut state = state.lock().await;
     let (body, publishes) = match request.body {
         RequestBody::Status => (ResponseBody::Status(StatusResponse::CURRENT), Vec::new()),
+        RequestBody::Population { online } => {
+            if let Some(peer) = state.peers.get_mut(&connection_id) {
+                peer.online = online.then(Instant::now);
+            }
+            let players = state.membership.len()
+                + state
+                    .peers
+                    .iter()
+                    .filter(|(id, peer)| {
+                        peer.online
+                            .is_some_and(|seen| seen.elapsed() < Duration::from_secs(10))
+                            && !state.membership.contains_key(id)
+                    })
+                    .count();
+            (
+                ResponseBody::Population {
+                    players: u32::try_from(players).unwrap_or(u32::MAX),
+                },
+                Vec::new(),
+            )
+        }
         RequestBody::CreateRoom {
             name,
             map,
@@ -954,6 +977,13 @@ fn create_room(
     available: master_protocol::ContentFlags,
     password: String,
 ) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    if requires.0 & !15 != 0
+        || requires.0 & 1 == 0
+        || !requires.missing_from(available).is_empty()
+        || !map_content_allowed(&map, requires)
+    {
+        return (ResponseBody::Error(ServiceError::InvalidAdvert), Vec::new());
+    }
     if state.membership.contains_key(&connection_id) {
         return (
             ResponseBody::Error(ServiceError::AlreadyHosting),
@@ -1102,6 +1132,18 @@ fn leave_room(
     (ResponseBody::RoomLeft, publishes)
 }
 
+fn map_content_allowed(map: &str, families: master_protocol::ContentFlags) -> bool {
+    let family = map.split_once(':').map_or("iw4", |(family, _)| family);
+    let bit = match family {
+        "iw4" => 1,
+        "iw5" => 2,
+        "t5" => 4,
+        "t6" => 8,
+        _ => return false,
+    };
+    families.0 & bit != 0
+}
+
 fn set_options(
     state: &mut ServiceState,
     connection_id: u64,
@@ -1112,7 +1154,9 @@ fn set_options(
     match state.host_of(connection_id) {
         Ok(room_id) => {
             let room = state.rooms.get_mut(&room_id).expect("host room");
-            if room.view.phase.in_match() && (room.view.map != map || room.view.mode != mode) {
+            if !map_content_allowed(&map, room.view.requires)
+                || (room.view.phase.in_match() && (room.view.map != map || room.view.mode != mode))
+            {
                 return (ResponseBody::Error(ServiceError::InvalidAdvert), Vec::new());
             }
             room.view.map = map;
@@ -1138,7 +1182,9 @@ fn start_match(
     match state.host_of(connection_id) {
         Ok(room_id) => {
             let room = state.rooms.get_mut(&room_id).expect("host room");
-            if room.view.phase.in_match() && (room.view.map != map || room.view.mode != mode) {
+            if !map_content_allowed(&map, room.view.requires)
+                || (room.view.phase.in_match() && (room.view.map != map || room.view.mode != mode))
+            {
                 return (ResponseBody::Error(ServiceError::InvalidAdvert), Vec::new());
             }
             room.view.map = map;

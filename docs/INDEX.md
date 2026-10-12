@@ -21,6 +21,7 @@ game. Keep them this short: nobody opens a long file twice.
 | [`KILLCAM.md`](KILLCAM.md) | archived cameras, life clipping, sound and FX transitions | projectile or autonomous weapon killcams |
 | [`AUDIO.md`](AUDIO.md) | client AudioRuntime, control/render/device threads, fixed slots, virtualization and offline PCM execution | touching sound ownership, playback or callback resources |
 | [`CUES.md`](CUES.md) | compiled cue semantics, typed spatial/routing requirements, media decode policy and revision ownership | changing cue or media preparation |
+| [`SERVER-ASSETS.md`](SERVER-ASSETS.md) | enabling optional games, join requirements and disabled-family loading | configuring a host for players with fewer games |
 | [`FAMILIES.md`](FAMILIES.md) | family identity, native dependencies, map-selected characters and supported FPV combinations | changing cross-family composition |
 | [`WEAPONS.md`](WEAPONS.md) | weapon configuration resolution, published consumer projections, host rules and registry lifetimes | changing attachments, combat or FPV preparation |
 | [`ANIM.md`](ANIM.md) | three floors: `anim_iw4` (facts and curves), `xmodel_runtime` (tree and pose), who picks the clip (`sim` / `render_frontend/adapters/anim/`) | viewmodel, skeleton, bone hits |

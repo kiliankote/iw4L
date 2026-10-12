@@ -68,7 +68,6 @@ pub(super) const MAX_SCRIPT_DEPTH: u32 = 16;
 const MAIN_MENU_DVAR: &str = "g_scriptMainMenu";
 const FALLBACK_MAIN_MENU: &str = "class";
 const SCOREBOARD_MENU: &str = "scoreboard";
-const FRONTEND_LOADING_MENU: &str = "iw4l_frontend_loading";
 
 pub(super) fn is_focusable(item: &asset_game::MenuItem) -> bool {
     if item.static_flags & WINDOW_DECORATION != 0 {
@@ -198,7 +197,6 @@ pub(crate) struct MenuInputs<'w, 's> {
     party: Res<'w, frame::UiPartyState>,
     frontend_strings: Option<Res<'w, asset_game::LocalizeCatalog>>,
     player_data: Option<Res<'w, sim::LocalPlayerData>>,
-    content_loading: Option<Res<'w, frame::FrontendContentLoading>>,
 }
 
 #[derive(Default)]
@@ -359,25 +357,7 @@ pub(crate) fn update_script_menus(
         binding: &mut out.binding,
     };
 
-    let main_menu = if frontend && input.content_loading.is_some() {
-        FRONTEND_LOADING_MENU
-    } else {
-        "iw4l_main"
-    };
-    if frontend
-        && main_menu == "iw4l_main"
-        && let Some(at) = runner.menus.position(FRONTEND_LOADING_MENU)
-    {
-        let above: Vec<String> = runner.menus.stack[at + 1..]
-            .iter()
-            .map(|open| open.name.clone())
-            .collect();
-        runner.close(FRONTEND_LOADING_MENU);
-        runner.open(main_menu);
-        for name in above {
-            runner.open(&name);
-        }
-    }
+    let main_menu = "iw4l_main";
     if frontend && screen_changed {
         runner.open(main_menu);
         if let Some(def) = catalog.get("main")
@@ -389,7 +369,7 @@ pub(crate) fn update_script_menus(
         }
     }
 
-    if frontend && main_menu == "iw4l_main" && *restore_lobby {
+    if frontend && *restore_lobby {
         *restore_lobby = false;
         if input.party.in_lobby && input.party.is_host {
             runner.open("game_lobby");

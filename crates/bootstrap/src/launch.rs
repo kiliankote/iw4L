@@ -83,8 +83,43 @@ struct ShellCommonTask {
     started: std::time::Instant,
 }
 
+fn start_shell_common_prepare(
+    mut commands: Commands,
+    screen: Res<AppScreen>,
+    identity: Res<LaunchIdentity>,
+    menus: Res<asset_game::MenuCatalog>,
+    task: Option<Res<ShellCommonTask>>,
+    shell: Option<Res<ShellUiImages>>,
+) {
+    if *screen != AppScreen::MainMenu || task.is_some() || shell.is_some() {
+        return;
+    }
+    let games = asset_transport::GamesRoot(identity.games_root.clone());
+    commands.insert_resource(ShellCommonTask {
+        task: assets::load_pool().spawn(assets::load_shell_common(games)),
+        perk_table: menus.string_table("mp/perkTable.csv").cloned(),
+        started: std::time::Instant::now(),
+    });
+    commands.insert_resource(frame::FrontendContentLoading);
+}
+
+fn register_shell_common_systems(app: &mut App) {
+    app.add_systems(
+        Update,
+        (
+            start_shell_common_prepare,
+            install_class_catalog,
+            adopt_shell_ui_images,
+        )
+            .chain()
+            .in_set(net::ClientSet::Load)
+            .after(frame::SessionSwapApplied),
+    );
+}
+
 fn install_class_catalog(
     mut commands: Commands,
+    screen: Res<AppScreen>,
     shell: Option<ResMut<ShellCommonTask>>,
     mut strings: ResMut<asset_game::LocalizeCatalog>,
     mut menus: ResMut<asset_game::MenuCatalog>,
@@ -92,6 +127,9 @@ fn install_class_catalog(
     mut player_data: ResMut<sim::LocalPlayerData>,
 ) {
     use bevy::tasks::futures_lite::future;
+    if *screen != AppScreen::MainMenu {
+        return;
+    }
     let Some(mut shell) = shell else {
         return;
     };
@@ -282,6 +320,11 @@ fn run_export_gltf(games: asset_transport::GamesRoot, artifacts: PathBuf, zone_a
         Ok(found.path),
         common_mp,
         asset_transport::LoadProgress::default(),
+        frame::AssetFamilies::from_inventory(
+            content_flags(&NamespaceTrees::discover(&games)).0,
+            &frame::UiMenuDvars::default(),
+        )
+        .unwrap_or_else(|error| fatal(&error)),
     )) {
         assets::MatchLoadOutcome::Ready(prepared) => prepared,
         assets::MatchLoadOutcome::Canceled => fatal("export-gltf: map walk canceled"),
@@ -440,14 +483,8 @@ fn run_menu(
         perk_table: menus.string_table("mp/perkTable.csv").cloned(),
         started: std::time::Instant::now(),
     })
-    .insert_resource(frame::FrontendContentLoading)
-    .add_systems(
-        Update,
-        (install_class_catalog, adopt_shell_ui_images)
-            .chain()
-            .in_set(net::ClientSet::Load)
-            .after(frame::SessionSwapApplied),
-    );
+    .insert_resource(frame::FrontendContentLoading);
+    register_shell_common_systems(&mut app);
     match load_mp_localized_strings(&ui_games, "iw4:code_post_gfx_mp") {
         Ok(loc) => {
             diag::info!(Launch, "menu: {} localize keys", loc.len());
@@ -592,8 +629,28 @@ fn run_map(
     let loading_title = asset_transport::map_load_title(&zone_arg_lc, game);
     let namespace_trees = NamespaceTrees::discover(&games);
     let have = content_flags(&namespace_trees);
-    let requires = net::content_required_by_map(&zone_arg_lc)
-        .unwrap_or_else(|error| fatal(&format!("master content: {error}")));
+    let families = if role == Role::Replay || std::env::var_os("IW4L_MASTER_JOIN").is_some() {
+        frame::AssetFamilies(have.0)
+    } else {
+        frame::AssetFamilies::from_inventory(have.0, &frame::UiMenuDvars::default())
+            .unwrap_or_else(|error| fatal(&error))
+    };
+    families
+        .require_map(&zone_arg_lc)
+        .unwrap_or_else(|error| fatal(&error));
+    if let Some(game) = game {
+        families
+            .require_map(&format!("{}:{zone}", game.prefix()))
+            .unwrap_or_else(|error| fatal(&error));
+    }
+    let master_map = game.map_or_else(
+        || zone.clone(),
+        |game| match game {
+            asset_core::ZoneGame::Iw4 => zone.clone(),
+            _ => format!("{}:{zone}", game.prefix()),
+        },
+    );
+    let requires = master_protocol::ContentFlags(families.0);
 
     let master_intent = if role == Role::Replay {
         net::MasterLaunchIntent::disabled()
@@ -604,10 +661,12 @@ fn run_map(
         );
         net::MasterLaunchIntent::disabled()
     } else {
-        net::MasterLaunchIntent::from_env_for_map(&zone, have, requires).unwrap_or_else(|error| {
-            diag::warn!(Net, "master launch disabled: {error}");
-            net::MasterLaunchIntent::disabled()
-        })
+        net::MasterLaunchIntent::from_env_for_map(&master_map, have, requires).unwrap_or_else(
+            |error| {
+                diag::warn!(Net, "master launch disabled: {error}");
+                net::MasterLaunchIntent::disabled()
+            },
+        )
     };
 
     let config = LaunchConfig {
@@ -683,6 +742,7 @@ fn run_map(
             zone_ff,
             common_mp,
             progress: progress.clone(),
+            families,
         })
         .insert_resource(LoadingScreen::new(
             progress.clone(),
@@ -718,6 +778,9 @@ fn run_map(
         Role::Replay => add_runtime_plugins_with_role(&mut app, frame::RuntimeRole::Replay),
         Role::Listen | Role::Dedicated => add_runtime_plugins(&mut app),
         Role::Client => add_runtime_plugins_with_role(&mut app, frame::RuntimeRole::Client),
+    }
+    if !dedicated {
+        register_shell_common_systems(&mut app);
     }
     app.world_mut()
         .resource_mut::<session::ScopeControl>()

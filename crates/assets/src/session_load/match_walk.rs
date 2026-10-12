@@ -6,6 +6,7 @@ pub(super) async fn walk_prepared_match(
     zone_ff: Result<PathBuf, String>,
     common_mp: Result<PathBuf, String>,
     progress: LoadProgress,
+    families: frame::AssetFamilies,
 ) -> (MatchLoadOutcome, Option<Arc<CommonSet>>) {
     let mut image_trees = games_root_from_env()
         .map(|root| asset_transport::NamespaceTrees::discover(&root))
@@ -16,6 +17,7 @@ pub(super) async fn walk_prepared_match(
     if let Ok(path) = &zone_ff {
         image_trees.adopt_zone(path);
     }
+    image_trees.retain(|ns| families.enabled(ns.as_str()));
     let zone_name = zone_ff
         .as_ref()
         .ok()
@@ -50,6 +52,7 @@ pub(super) async fn walk_prepared_match(
         zone_ff.as_ref().ok().map(PathBuf::as_path),
         common_mp.as_ref().ok().map(PathBuf::as_path),
         &mut donor_report,
+        families,
     );
     let waiting = progress.begin_scoped(StageId::CommonAssets, "shared common", None);
     let (common, reach) = ensure_common(key).await;
