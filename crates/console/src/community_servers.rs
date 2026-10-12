@@ -35,15 +35,25 @@ pub(crate) fn community_server_menu(
         ),
     );
     let choices = servers.display_choices(counts);
-    if let Some(item) = catalog
+    // A mutable catalog borrow marks it changed, and HUD re-uploads every zone image on change.
+    let stale = catalog
         .menus
-        .get_mut("options_community_servers")
+        .get("options_community_servers")
         .and_then(|menu| {
             menu.items
-                .iter_mut()
+                .iter()
                 .find(|item| item.name == "community_server")
         })
-        && item.choices != choices
+        .is_some_and(|item| item.choices != choices);
+    if stale
+        && let Some(item) = catalog
+            .menus
+            .get_mut("options_community_servers")
+            .and_then(|menu| {
+                menu.items
+                    .iter_mut()
+                    .find(|item| item.name == "community_server")
+            })
     {
         item.choices = choices;
     }
