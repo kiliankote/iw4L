@@ -3261,12 +3261,13 @@ fn drain_pellet_fx(
     tracers: Option<Res<PreparedTracers>>,
     mut tracer_world: ResMut<TracerWorld>,
     mut gate: ResMut<TracerDrawGate>,
-    (local, generation, timeline, mut occurrences, verdicts): (
+    (local, generation, timeline, mut occurrences, verdicts, mut dyn_ent_hits): (
         Res<LocalPresentClient>,
         Res<frame::WorldGeneration>,
         Res<net::EntityEventCursor>,
         ResMut<PresentedFireFx>,
         Res<net::FireVerdictState>,
+        MessageWriter<crate::adapters::anim::dyn_ent_wake::DynEntPelletHit>,
     ),
     mut host: ResMut<HostFxSystem>,
     mut cursor: ResMut<FxJournalCursor>,
@@ -3279,6 +3280,14 @@ fn drain_pellet_fx(
     for (world, domain, record) in pending.take() {
         if world != generation.stamp() {
             continue;
+        }
+        if domain != net::EntityEventDomain::Predicted && record.normal != [0.0; 3] {
+            dyn_ent_hits.write(crate::adapters::anim::dyn_ent_wake::DynEntPelletHit {
+                world,
+                weapon: record.weapon,
+                start: Vec3::from_array(record.start),
+                end: Vec3::from_array(record.end),
+            });
         }
         let now = host.0.msec_now;
         let request = FireFxRequest {
