@@ -56,6 +56,7 @@ fn remote_missile_link(
 #[derive(Default)]
 pub struct RemoteMissileView {
     held: Option<HeldMissileView>,
+    turn: MissileTurn,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -63,6 +64,64 @@ struct HeldMissileView {
     life: LifeSequence,
     projectile: ProjectileId,
     pose: WorldCameraPose,
+}
+
+const TURN_SAMPLES: usize = 4;
+
+#[derive(Default)]
+struct MissileTurn {
+    missile: Option<(LifeSequence, ProjectileId)>,
+    archived: bool,
+    samples: Vec<(i32, [f32; 3])>,
+}
+
+impl MissileTurn {
+    fn record(
+        &mut self,
+        missile: (LifeSequence, ProjectileId),
+        archived: bool,
+        snapshot_ms: i32,
+        angles: [f32; 3],
+    ) {
+        // The final killcam of the pilot's own kill replays the same missile
+        // of the same life from seat snapshots stamped with the live tick,
+        // later than every sample of the flight, so a switch between live and
+        // archived presentation starts a fresh history.
+        if self.missile != Some(missile) || self.archived != archived {
+            self.missile = Some(missile);
+            self.archived = archived;
+            self.samples.clear();
+        }
+        match self.samples.last_mut() {
+            Some(last) if last.0 == snapshot_ms => last.1 = angles,
+            Some(last) if last.0 > snapshot_ms => {
+                self.samples.clear();
+                self.samples.push((snapshot_ms, angles));
+            }
+            _ => {
+                if self.samples.len() == TURN_SAMPLES {
+                    self.samples.remove(0);
+                }
+                self.samples.push((snapshot_ms, angles));
+            }
+        }
+    }
+
+    fn angles_at(&self, at_time: i32) -> Option<[f32; 3]> {
+        let shown = at_time.saturating_sub(AUTHORITY_MS);
+        let &(first_ms, first) = self.samples.first()?;
+        if shown <= first_ms {
+            return Some(first);
+        }
+        let Some(pair) = self.samples.windows(2).find(|pair| shown < pair[1].0) else {
+            return self.samples.last().map(|&(_, newest)| newest);
+        };
+        let ((from_ms, from), (to_ms, to)) = (pair[0], pair[1]);
+        let fraction = (shown - from_ms) as f32 / (to_ms - from_ms) as f32;
+        Some(std::array::from_fn(|i| {
+            from[i] + math_iw4::angle_subtract(to[i], from[i]) * fraction
+        }))
+    }
 }
 
 impl RemoteMissileView {
@@ -76,6 +135,7 @@ impl RemoteMissileView {
         let at_time = presented.trajectory_time_ms(render_time);
         let Some((link, life)) = remote_missile_link(presented, local) else {
             self.held = None;
+            self.turn = MissileTurn::default();
             return None;
         };
         self.held = self
@@ -93,9 +153,15 @@ impl RemoteMissileView {
             .flatten();
         let snapshot_ms = presented.tick().map_or(at_time, sim::level_time_ms);
         if let Some(missile) = flying {
+            self.turn.record(
+                (life, link.projectile),
+                presented.is_archived_replay(),
+                snapshot_ms,
+                link.angles,
+            );
             let pose = WorldCameraPose {
                 origin: missile_eye(missile, snapshot_ms, at_time, clip),
-                angles: link.angles,
+                angles: self.turn.angles_at(at_time).unwrap_or(link.angles),
             };
             self.held = Some(HeldMissileView {
                 life,
