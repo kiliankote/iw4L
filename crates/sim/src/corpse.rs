@@ -38,6 +38,8 @@ pub struct PlayerCorpseSlot {
     pub ground_entity_num: i32,
 
     pub spawn_time_ms: i32,
+
+    pub shield: Option<crate::ShieldAttachment>,
 }
 
 impl Default for PlayerCorpseSlot {
@@ -60,6 +62,7 @@ impl Default for PlayerCorpseSlot {
             falling: false,
             ground_entity_num: ENTITYNUM_NONE,
             spawn_time_ms: 0,
+            shield: None,
         }
     }
 }
@@ -160,6 +163,10 @@ pub(crate) fn occupy_player_clone(
     ps: &PlayerState,
     time_ms: i32,
 ) -> u8 {
+    let shield = world
+        .client_meta(victim)
+        .and_then(|meta| meta.shield)
+        .filter(|shield| shield.on_back);
     let pool = world.corpses_mut();
     let entnum = pool.alloc_clone_entity();
     let slot = pool.get_free(ps.origin);
@@ -182,6 +189,7 @@ pub(crate) fn occupy_player_clone(
             tr_base: ps.origin,
             falling: true,
             spawn_time_ms: time_ms,
+            shield,
             ..PlayerCorpseSlot::default()
         },
     );
