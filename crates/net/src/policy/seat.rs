@@ -273,6 +273,13 @@ fn seat_snapshot(
         return (live.clone(), None);
     }
     let archived = lookup.tick.and_then(|tick| archive.frame(tick));
+    overlay_archived_cameras(
+        &mut out,
+        live,
+        archived.map(|f| &f.snapshot),
+        viewer,
+        session.focus_client,
+    );
     overlay_killcam_hud(
         &mut out,
         live,
@@ -339,6 +346,31 @@ fn overlay_archived_world(
     let delta_ms = sim::level_time_ms(live.tick).wrapping_sub(sim::level_time_ms(archived.tick));
     rebase_archived_world(&mut out, viewer, delta_ms);
     out
+}
+
+fn overlay_archived_cameras(
+    out: &mut Snapshot,
+    live: &Snapshot,
+    archived: Option<&Snapshot>,
+    viewer: ClientId,
+    focus: ClientId,
+) {
+    let focus_row = archived.and_then(|snap| snap.meta.for_client(focus));
+    let delta_ms = archived.map_or(0, |snap| {
+        sim::level_time_ms(live.tick).wrapping_sub(sim::level_time_ms(snap.tick))
+    });
+    let linked_weapon_view = focus_row.and_then(|meta| meta.linked_weapon_view);
+    let remote_missile =
+        focus_row
+            .and_then(|meta| meta.remote_missile)
+            .map(|link| sim::RemoteMissile {
+                unlink_at_ms: link.unlink_at_ms.map(|ms| ms.wrapping_add(delta_ms)),
+                ..link
+            });
+    if let Some((_, meta)) = out.meta.clients.iter_mut().find(|(id, _)| *id == viewer) {
+        meta.linked_weapon_view = linked_weapon_view;
+        meta.remote_missile = remote_missile;
+    }
 }
 
 fn rebase_entity_state(es: &mut entity_iw4::EntityState, delta_ms: i32) {
