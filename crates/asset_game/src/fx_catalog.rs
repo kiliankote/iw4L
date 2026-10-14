@@ -274,6 +274,8 @@ pub struct OwnedFxElemDef {
     pub trail_def: Option<OwnedFxTrailDef>,
 
     pub spark_fountain_def: Option<OwnedFxSparkFountainDef>,
+
+    pub phys_pieces: Vec<Option<fx_iw4::FxPhysPiece>>,
 }
 
 impl OwnedFxElemDef {
@@ -336,6 +338,11 @@ impl OwnedFxElemDef {
             OwnedFxVisual::None => Some(AssetEdge::Absent),
             _ => None,
         }
+    }
+
+    pub fn phys_piece(&self, random_seed: u64) -> Option<fx_iw4::FxPhysPiece> {
+        let idx = fx_iw4::elem_visual_index(self.view.visual_count, random_seed);
+        self.phys_pieces.get(idx).copied().flatten()
     }
 
     pub fn decal_mark_pair(&self, random_seed: u64) -> Option<&OwnedFxVisual> {
@@ -953,6 +960,15 @@ impl FxDefinitions {
                         *edge = model_hint_edge(ns, hint.as_deref(), models);
                     }
                 }
+                elem.phys_pieces =
+                    if fx_iw4::elem_skips_position_update(elem.view.elem_type, elem.view.flags) {
+                        elem.visuals
+                            .iter()
+                            .map(|vis| model_phys_piece(vis, models))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
             }
         }
     }
@@ -1446,6 +1462,7 @@ fn capture_elem(
         has_extended,
         trail_def,
         spark_fountain_def,
+        phys_pieces: Vec::new(),
     })
 }
 
@@ -1693,6 +1710,17 @@ fn model_hint_edge(
             None => AssetEdge::Unresolved(AssetEdgeReason::CatalogMiss),
         },
     }
+}
+
+fn model_phys_piece(
+    vis: &OwnedFxVisual,
+    models: &crate::FxModelCatalog,
+) -> Option<fx_iw4::FxPhysPiece> {
+    let OwnedFxVisual::Model { edge, .. } = vis else {
+        return None;
+    };
+    let (mid, half) = models.get_at(edge.bound_index()?)?.skel.bounds?;
+    fx_iw4::FxPhysPiece::from_bounds(mid, half)
 }
 
 fn resolve_material_visual(
@@ -2056,6 +2084,7 @@ fn leftover_capture_elem_t5(
         has_extended,
         trail_def: None,
         spark_fountain_def: None,
+        phys_pieces: Vec::new(),
     })
 }
 
@@ -2544,5 +2573,6 @@ fn capture_elem_t6(
         has_extended: false,
         trail_def: None,
         spark_fountain_def: None,
+        phys_pieces: Vec::new(),
     })
 }
