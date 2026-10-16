@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use master_protocol::{
@@ -29,6 +29,7 @@ use crate::transport::fragment::{Fragmenter, Reassembler};
 use crate::transport::protocol::{ContentFingerprint, HandshakeHello, MatchDescriptor};
 use crate::transport::udp_session::{RelayMailbox, UdpAuthorityHub, UdpClientLink};
 
+pub(crate) mod limits;
 mod population;
 pub use population::CommunityPlayerCounts;
 
@@ -59,16 +60,105 @@ pub fn content_names(flags: ContentFlags) -> String {
 
 const RELAY_PACKET_BYTES: usize = crate::transport::protocol::MAX_PACKET_BYTES as usize;
 const HOST_DATA_CAP: usize = 64;
-const HOST_CONTROL_CAP: usize = 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MasterOperationOutcome {
+    Succeeded,
+    Refused(String),
+    RemoteOutcomeUnknown(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MasterOperationResult {
+    pub request_id: u64,
+    pub outcome: MasterOperationOutcome,
+}
+
+struct QueuedControl {
+    frame: ControlFrame,
+    deadline: tokio::time::Instant,
+    _bytes: tokio::sync::OwnedSemaphorePermit,
+}
+
+struct ControlSender {
+    tx: tokio::sync::mpsc::Sender<QueuedControl>,
+    pending: Mutex<HashMap<u64, tokio::time::Instant>>,
+    outcomes: Arc<Mutex<VecDeque<MasterOperationResult>>>,
+    bytes: Arc<tokio::sync::Semaphore>,
+}
+
+impl ControlSender {
+    fn complete_response(&self, response: &ControlResponse) -> Option<tokio::time::Instant> {
+        let deadline = self
+            .pending
+            .lock()
+            .expect("control requests poisoned")
+            .remove(&response.request_id)?;
+        let outcome = if deadline <= tokio::time::Instant::now() {
+            MasterOperationOutcome::RemoteOutcomeUnknown("response deadline".into())
+        } else if let ResponseBody::Error(error) = &response.body {
+            MasterOperationOutcome::Refused(error.to_string())
+        } else {
+            MasterOperationOutcome::Succeeded
+        };
+        self.outcomes
+            .lock()
+            .expect("control outcomes poisoned")
+            .push_back(MasterOperationResult {
+                request_id: response.request_id,
+                outcome,
+            });
+        Some(deadline)
+    }
+
+    fn close_pending(&self) {
+        let mut pending = self.pending.lock().expect("control requests poisoned");
+        let mut outcomes = self.outcomes.lock().expect("control outcomes poisoned");
+        outcomes.extend(
+            pending
+                .drain()
+                .map(|(request_id, _)| MasterOperationResult {
+                    request_id,
+                    outcome: MasterOperationOutcome::RemoteOutcomeUnknown(
+                        "connection closed before correlated response".into(),
+                    ),
+                }),
+        );
+    }
+
+    fn expire(&self, role: &'static str) -> std::result::Result<(), TransportFault> {
+        let now = tokio::time::Instant::now();
+        let mut pending = self.pending.lock().expect("control requests poisoned");
+        if let Some(id) = pending
+            .iter()
+            .find_map(|(id, deadline)| (*deadline <= now).then_some(*id))
+        {
+            pending.remove(&id);
+            self.outcomes
+                .lock()
+                .expect("control outcomes poisoned")
+                .push_back(MasterOperationResult {
+                    request_id: id,
+                    outcome: MasterOperationOutcome::RemoteOutcomeUnknown(
+                        "response deadline".into(),
+                    ),
+                });
+            return Err(TransportFault::new(
+                "control_response",
+                role,
+                format!("request {id} deadline; remote outcome unknown"),
+            ));
+        }
+        Ok(())
+    }
+}
 
 const BOOTSTRAP_PRIORITY: i32 = -32;
 const DNS_DEADLINE: Duration = Duration::from_secs(8);
 const CONNECT_RETRY_FIRST: Duration = Duration::from_secs(1);
 const CONNECT_RETRY_MAX: Duration = Duration::from_secs(6);
 const CONNECT_RACE: usize = 4;
-const CONNECT_BUDGET: Duration = SESSION_IDLE;
 const CLIENT_KEEP_ALIVE: Duration = Duration::from_millis(250);
-const LEAVE_DRAIN: Duration = Duration::from_millis(500);
 const DATAGRAM_SEND_BUFFER: usize = 1024 * 1024;
 const QUEUE_POLL: Duration = Duration::from_millis(5);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -80,10 +170,12 @@ fn blocking_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn endpoint_build() -> String {
@@ -103,9 +195,52 @@ fn relay_reassembler() -> Reassembler {
     Reassembler::new(master_protocol::MAX_OPAQUE_PAYLOAD, RELAY_PACKET_BYTES)
 }
 
-fn take_commands(commands: &Mutex<Vec<MasterBridgeCommand>>) -> Vec<MasterBridgeCommand> {
+struct QueuedCommand {
+    command: MasterBridgeCommand,
+    deadline: tokio::time::Instant,
+}
+
+fn take_commands(
+    commands: &Mutex<Vec<QueuedCommand>>,
+    role: &'static str,
+) -> std::result::Result<Vec<MasterBridgeCommand>, TransportFault> {
     let mut queue = commands.lock().expect("master command queue poisoned");
-    std::mem::take(&mut *queue)
+    let commands = std::mem::take(&mut *queue);
+    if commands
+        .iter()
+        .any(|command| command.deadline <= tokio::time::Instant::now())
+    {
+        return Err(TransportFault::new(
+            "local_command",
+            role,
+            "command queue deadline",
+        ));
+    }
+    Ok(commands
+        .into_iter()
+        .map(|command| command.command)
+        .collect())
+}
+
+async fn command_deadline(
+    commands: &Mutex<Vec<QueuedCommand>>,
+    role: &'static str,
+) -> TransportFault {
+    loop {
+        if commands
+            .lock()
+            .expect("master command queue poisoned")
+            .iter()
+            .any(|command| command.deadline <= tokio::time::Instant::now())
+        {
+            return TransportFault::new(
+                "local_command",
+                role,
+                "command expired before connection; not sent",
+            );
+        }
+        tokio::time::sleep(QUEUE_POLL).await;
+    }
 }
 
 fn classify_try_send<T>(
@@ -485,7 +620,9 @@ enum MasterBridgeCommand {
     MatchEnded {
         match_key: frame::MatchKey,
     },
-    AuthorityProgress,
+    AuthorityProgress {
+        now_ms: u64,
+    },
     AdmitEnter {
         member_id: MemberId,
         epoch: u32,
@@ -494,6 +631,19 @@ enum MasterBridgeCommand {
         client_id: u32,
     },
     Shutdown,
+}
+
+impl MasterBridgeCommand {
+    fn queued_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::SetPassword { password } => password.capacity(),
+                Self::UpdateLobby { map, mode } | Self::StartMatch { map, mode } => {
+                    map.capacity() + mode.capacity()
+                }
+                _ => 0,
+            }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -623,7 +773,8 @@ impl MasterBridgeState {
 #[derive(Resource)]
 pub struct MasterBridge {
     state: Arc<Mutex<MasterBridgeState>>,
-    commands: Arc<Mutex<Vec<MasterBridgeCommand>>>,
+    commands: Arc<Mutex<Vec<QueuedCommand>>>,
+    outcomes: Arc<Mutex<VecDeque<MasterOperationResult>>>,
     installed_load: Arc<Mutex<Option<frame::LocalLoadKey>>>,
     mailbox: RelayMailbox,
     bootstrap: Arc<BootstrapLane>,
@@ -652,15 +803,52 @@ impl MasterBridge {
         self.close.cancel();
     }
 
+    pub fn take_operation_results(&self) -> Vec<MasterOperationResult> {
+        self.outcomes
+            .lock()
+            .expect("control outcomes poisoned")
+            .drain(..)
+            .collect()
+    }
+
     pub fn mailbox(&self) -> RelayMailbox {
         self.mailbox.clone()
     }
 
     fn send(&self, command: MasterBridgeCommand) {
-        self.commands
-            .lock()
-            .expect("master command queue poisoned")
-            .push(command);
+        let mut commands = self.commands.lock().expect("master command queue poisoned");
+        if matches!(command, MasterBridgeCommand::AuthorityProgress { .. })
+            && let Some(queued) = commands.iter_mut().find(|queued| {
+                matches!(
+                    queued.command,
+                    MasterBridgeCommand::AuthorityProgress { .. }
+                )
+            })
+        {
+            queued.command = command;
+            return;
+        }
+        if commands.len() >= limits::values().queue_items
+            || commands
+                .iter()
+                .map(|queued| queued.command.queued_bytes())
+                .sum::<usize>()
+                .saturating_add(command.queued_bytes())
+                > limits::values().queue_bytes
+        {
+            drop(commands);
+            publish_failed(
+                &self.state,
+                self.state().identity(),
+                TransportFault::new("local_command", "local", "command budget exhausted"),
+            );
+            self.close.cancel();
+            return;
+        }
+        commands.push(QueuedCommand {
+            command,
+            deadline: tokio::time::Instant::now() + limits::values().queue_age,
+        });
     }
 
     pub fn set_installed_load(&self, load: Option<frame::LocalLoadKey>) {
@@ -692,7 +880,7 @@ impl MasterBridge {
     }
 
     pub fn report_authority_progress(&self) {
-        self.send(MasterBridgeCommand::AuthorityProgress);
+        self.send(MasterBridgeCommand::AuthorityProgress { now_ms: now_ms() });
     }
 
     pub fn report_match_ended(&self, match_key: frame::MatchKey) {
@@ -736,7 +924,10 @@ impl MasterBridge {
 impl Drop for MasterBridge {
     fn drop(&mut self) {
         if let Ok(mut queue) = self.commands.lock() {
-            queue.push(MasterBridgeCommand::Shutdown);
+            queue.push(QueuedCommand {
+                command: MasterBridgeCommand::Shutdown,
+                deadline: tokio::time::Instant::now() + limits::values().shutdown,
+            });
         }
         self.close.cancel();
         let _ = self.worker.take();
@@ -1112,9 +1303,11 @@ async fn browse(
             }),
         )
         .await?;
+        let response_deadline = tokio::time::Instant::now() + limits::values().response;
         let (generation, adverts) = loop {
             let frame = tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep_until(response_deadline) => return Err("room list response deadline".into()),
                 frame = read_frame(&mut recv) => frame?,
             };
             match frame {
@@ -1127,9 +1320,9 @@ async fn browse(
                         },
                 }) if id == request_id => break (generation, adverts),
                 ControlFrame::Response(ControlResponse {
+                    request_id: id,
                     body: ResponseBody::Error(error),
-                    ..
-                }) => return Err(error.into()),
+                }) if id == request_id => return Err(error.into()),
                 ControlFrame::Response(_)
                 | ControlFrame::RoomView(_)
                 | ControlFrame::Closed { .. }
@@ -1188,7 +1381,8 @@ async fn wait_for_refresh(refresh: &AtomicU64, cancel: &CancellationToken) -> bo
 struct WorkerCtx {
     player_name: String,
     state: Arc<Mutex<MasterBridgeState>>,
-    commands: Arc<Mutex<Vec<MasterBridgeCommand>>>,
+    commands: Arc<Mutex<Vec<QueuedCommand>>>,
+    outcomes: Arc<Mutex<VecDeque<MasterOperationResult>>>,
     installed_load: Arc<Mutex<Option<frame::LocalLoadKey>>>,
     mailbox: RelayMailbox,
     bootstrap: Arc<BootstrapLane>,
@@ -1223,6 +1417,7 @@ fn spawn_worker(role: &'static str, kind: SessionKind, player_name: String) -> M
     }
     let state = Arc::new(Mutex::new(MasterBridgeState::Connecting { identity }));
     let commands = Arc::new(Mutex::new(Vec::new()));
+    let outcomes = Arc::new(Mutex::new(VecDeque::new()));
     let installed_load = Arc::new(Mutex::new(None));
     let bootstrap = BootstrapLane::new();
     let mailbox = RelayMailbox::new(HOST_DATA_CAP);
@@ -1234,6 +1429,7 @@ fn spawn_worker(role: &'static str, kind: SessionKind, player_name: String) -> M
         player_name,
         state: Arc::clone(&state),
         commands: Arc::clone(&commands),
+        outcomes: Arc::clone(&outcomes),
         installed_load: Arc::clone(&installed_load),
         mailbox: mailbox.clone(),
         bootstrap: Arc::clone(&bootstrap),
@@ -1257,6 +1453,7 @@ fn spawn_worker(role: &'static str, kind: SessionKind, player_name: String) -> M
     MasterBridge {
         state,
         commands,
+        outcomes,
         installed_load,
         mailbox,
         bootstrap,
@@ -1382,6 +1579,8 @@ fn report_committed_authority_progress(
     bridge: Option<Res<MasterBridge>>,
     server_tick: Option<Res<crate::authority::runtime::ServerTick>>,
     hold: Option<Res<crate::AuthorityLoadHold>>,
+    installed: Option<Res<frame::InstalledMatch>>,
+    mut reported: Local<Option<(u64, frame::LocalLoadKey, sim::Tick)>>,
 ) {
     let Some(bridge) = bridge else {
         return;
@@ -1389,9 +1588,23 @@ fn report_committed_authority_progress(
     if hold.is_some_and(|hold| hold.0) {
         return;
     }
-    if server_tick.is_some_and(|tick| tick.0.is_some()) {
-        bridge.report_authority_progress();
+    let (Some(installed), Some(tick)) = (
+        installed,
+        server_tick
+            .as_ref()
+            .and_then(|tick| tick.0.as_ref())
+            .map(|tick| tick.snapshot.tick),
+    ) else {
+        return;
+    };
+    let context = (bridge.incarnation(), installed.load_key);
+    if reported.is_some_and(|(incarnation, key, previous)| {
+        (incarnation, key) == context && tick.0 <= previous.0
+    }) {
+        return;
     }
+    *reported = Some((context.0, context.1, tick));
+    bridge.report_authority_progress();
 }
 
 fn open_hosted_epoch_when_world_is_live(
@@ -1449,6 +1662,14 @@ fn observe_master_bridge(
     let Some(bridge) = bridge else {
         return;
     };
+    for result in bridge.take_operation_results() {
+        diag::info!(
+            Net,
+            "master operation: request={} outcome={:?}",
+            result.request_id,
+            result.outcome
+        );
+    }
     let current = bridge.state();
     let identity = current.identity();
     if current.in_match()
@@ -1532,7 +1753,7 @@ fn execute_host_match_effects(
     effects: Vec<HostMatchEffect>,
     map_ready: &Mutex<HashSet<MemberId>>,
     facts: &Mutex<Vec<MasterLifecycleFact>>,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: &ControlSender,
     request_id: &mut u64,
     role: &'static str,
 ) -> std::result::Result<(), TransportFault> {
@@ -1633,6 +1854,7 @@ async fn session_main(
         player_name,
         state,
         commands,
+        outcomes,
         installed_load,
         mailbox,
         bootstrap,
@@ -1667,9 +1889,11 @@ async fn session_main(
         target.server_name,
         endpoint_build()
     );
-    let (_endpoint, connection) = connect(&target, &cancel)
-        .await
-        .map_err(|error| TransportFault::new("connect", role, error.to_string()))?;
+    let (_endpoint, connection) = tokio::select! {
+        _ = close.cancelled() => return Ok(()),
+        fault = command_deadline(&commands, role) => return Err(fault),
+        result = connect(&target, &cancel) => result.map_err(|error| TransportFault::new("connect", role, error.to_string()))?,
+    };
     diag::info!(
         Net,
         "master {role} hello build={} wire={} game={} attempt={}",
@@ -1697,7 +1921,14 @@ async fn session_main(
     .await
     .map_err(|error| TransportFault::with_connection("hello", role, error, &connection))?;
 
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlFrame>(HOST_CONTROL_CAP);
+    let (tx, mut control_rx) =
+        tokio::sync::mpsc::channel::<QueuedControl>(limits::values().queue_items);
+    let control_tx = ControlSender {
+        tx,
+        pending: Mutex::new(HashMap::new()),
+        outcomes,
+        bytes: Arc::new(tokio::sync::Semaphore::new(limits::values().queue_bytes)),
+    };
     let mut children = tokio::task::JoinSet::new();
     {
         let writer_connection = connection.clone();
@@ -1710,7 +1941,10 @@ async fn session_main(
                     _ = writer_cancel.cancelled() => return Ok(()),
                     frame = control_rx.recv() => {
                         let Some(frame) = frame else { return Ok(()) };
-                        write_frame(&mut writer, &frame).await.map_err(|error| {
+                        tokio::time::timeout_at(frame.deadline, write_frame(&mut writer, &frame.frame))
+                            .await
+                            .map_err(|_| TransportFault::new("control_write", writer_role, "control queue/write deadline"))?
+                            .map_err(|error| {
                             TransportFault::with_connection(
                                 "control_write",
                                 writer_role,
@@ -1743,10 +1977,12 @@ async fn session_main(
         role,
         is_host,
     ));
-    let (bootstrap_jobs, bootstrap_rx) =
-        tokio::sync::mpsc::channel::<(frame::MatchKey, MemberId, Vec<u8>)>(
-            MAX_CONCURRENT_BOOTSTRAP as usize,
-        );
+    let (bootstrap_tx, bootstrap_rx) =
+        tokio::sync::mpsc::channel::<BootstrapJob>(MAX_CONCURRENT_BOOTSTRAP as usize);
+    let bootstrap_jobs = BootstrapSender {
+        tx: bootstrap_tx,
+        bytes: Arc::new(tokio::sync::Semaphore::new(limits::values().queue_bytes)),
+    };
     let (prepared_tx, mut prepared_rx) =
         tokio::sync::mpsc::channel::<HostMatchEvent>(MAX_CONCURRENT_BOOTSTRAP as usize);
     children.spawn(bootstrap_egress(
@@ -1806,6 +2042,9 @@ async fn session_main(
         if cancel.is_cancelled() {
             break Ok(());
         }
+        if !closing && let Err(error) = control_tx.expire(role) {
+            break Err(error);
+        }
         if !closing
             && let Err(error) = pump_local_queues(
                 identity.match_key(),
@@ -1819,6 +2058,9 @@ async fn session_main(
             )
         {
             break Err(error);
+        }
+        if let Err(error) = mailbox.check_control_deadlines() {
+            break Err(TransportFault::new("relay_queue", role, error));
         }
         let mut control_error = None;
         for (member_id, payload) in mailbox.take_control_outbound() {
@@ -1853,7 +2095,11 @@ async fn session_main(
             break Err(error);
         }
         let mut command_error = None;
-        for command in take_commands(&commands) {
+        let queued = match take_commands(&commands, role) {
+            Ok(commands) => commands,
+            Err(error) => break Err(error),
+        };
+        for command in queued {
             match handle_command(
                 command,
                 &installed_load,
@@ -1875,7 +2121,7 @@ async fn session_main(
                     );
                     closing = true;
                     leave_request = Some(request_id);
-                    leave_at = Some(tokio::time::Instant::now() + LEAVE_DRAIN);
+                    leave_at = Some(tokio::time::Instant::now() + limits::values().shutdown);
                 }
                 Err(error) => {
                     command_error = Some(error);
@@ -1888,7 +2134,14 @@ async fn session_main(
         }
         tokio::select! {
             _ = cancel.cancelled() => break Ok(()),
-            _ = close.cancelled(), if !closing => {}
+            _ = close.cancelled(), if !closing => {
+                let id = take_id(&mut request_id);
+                let body = if is_host { RequestBody::CloseRoom } else { RequestBody::LeaveRoom };
+                if let Err(error) = enqueue_control(&control_tx, ControlFrame::Request(ControlRequest { request_id: id, body }), role) { break Err(error); }
+                closing = true;
+                leave_request = Some(id);
+                leave_at = Some(tokio::time::Instant::now() + limits::values().shutdown);
+            }
             _ = async {
                 match leave_at {
                     Some(at) => tokio::time::sleep_until(at).await,
@@ -1898,7 +2151,7 @@ async fn session_main(
                 diag::warn!(
                     Net,
                     "master {role} closed: relay did not confirm within {}ms",
-                    LEAVE_DRAIN.as_millis()
+                    limits::values().shutdown.as_millis()
                 );
                 break Ok(());
             }
@@ -1938,6 +2191,9 @@ async fn session_main(
                 }
             }
             (recv, frame) = async {
+                while facts.lock().expect("master facts poisoned").len() >= limits::values().queue_items.max(master_protocol::MAX_SESSION_MEMBERS as usize + 1) {
+                    tokio::time::sleep(QUEUE_POLL).await;
+                }
                 mailbox.wait_control_inbound_capacity().await;
                 (&mut next_control).await
             } => {
@@ -2012,10 +2268,11 @@ async fn session_main(
         }
     };
 
+    control_tx.close_pending();
     cancel.cancel();
     connection.close(0_u8.into(), b"session closed");
     drop(bootstrap_jobs);
-    let _ = tokio::time::timeout(LEAVE_DRAIN, async {
+    let _ = tokio::time::timeout(limits::values().shutdown, async {
         while children.join_next().await.is_some() {}
     })
     .await;
@@ -2037,19 +2294,46 @@ fn take_id(request_id: &mut u64) -> u64 {
 }
 
 fn enqueue_control(
-    tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    tx: &ControlSender,
     frame: ControlFrame,
     role: &'static str,
 ) -> std::result::Result<(), TransportFault> {
-    classify_try_send(tx.try_send(frame), "control_write").map_err(|loss| {
-        TransportFault::new(
-            match loss {
-                QueueLoss::Full { operation } | QueueLoss::Closed { operation } => operation,
-            },
+    let encoded = encode_stream_frame(&frame)
+        .map_err(|error| TransportFault::new("control_encode", role, error.to_string()))?;
+    let bytes = tx
+        .bytes
+        .clone()
+        .try_acquire_many_owned(encoded.len() as u32)
+        .map_err(|_| TransportFault::new("control_write", role, "control byte budget exhausted"))?;
+    let deadline = tokio::time::Instant::now() + limits::values().queue_age;
+    let id = match &frame {
+        ControlFrame::Request(request) => Some(request.request_id),
+        _ => None,
+    };
+    let mut pending = tx.pending.lock().expect("control requests poisoned");
+    if id.is_some()
+        && pending.len() + tx.outcomes.lock().expect("control outcomes poisoned").len()
+            >= limits::values().queue_items
+    {
+        return Err(TransportFault::new(
+            "control_request",
             role,
-            loss.to_string(),
-        )
-    })
+            "pending request budget exhausted",
+        ));
+    }
+    classify_try_send(
+        tx.tx.try_send(QueuedControl {
+            frame,
+            deadline,
+            _bytes: bytes,
+        }),
+        "control_write",
+    )
+    .map_err(|loss| TransportFault::new("control_write", role, loss.to_string()))?;
+    if let Some(id) = id {
+        pending.insert(id, tokio::time::Instant::now() + limits::values().response);
+    }
+    Ok(())
 }
 
 fn flatten_task(
@@ -2202,7 +2486,7 @@ fn sync_membership_facts(
 fn handle_command(
     command: MasterBridgeCommand,
     installed_load: &Mutex<Option<frame::LocalLoadKey>>,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: &ControlSender,
     request_id: &mut u64,
     facts: &Mutex<Vec<MasterLifecycleFact>>,
     host_match: &mut HostMatchCore,
@@ -2369,14 +2653,11 @@ fn handle_command(
                 role,
             )?;
         }
-        MasterBridgeCommand::AuthorityProgress => {
+        MasterBridgeCommand::AuthorityProgress { now_ms } => {
             if !is_host {
                 return Ok(CommandEffect::Continue);
             }
-            let applied = apply_host(
-                host_match,
-                HostMatchEvent::AuthorityProgress { now_ms: now_ms() },
-            );
+            let applied = apply_host(host_match, HostMatchEvent::AuthorityProgress { now_ms });
             execute_host_match_effects(
                 applied.effects,
                 map_ready,
@@ -2457,7 +2738,7 @@ fn handle_frame(
     frame: ControlFrame,
     state: &Mutex<MasterBridgeState>,
     facts: &Mutex<Vec<MasterLifecycleFact>>,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: &ControlSender,
     request_id: &mut u64,
     bootstrap: &BootstrapLane,
     session: &mut SessionCore,
@@ -2484,6 +2765,20 @@ fn handle_frame(
             "service sent a request on the client stream",
         )),
         ControlFrame::Response(response) => {
+            let deadline = control_tx.complete_response(&response);
+            let Some(deadline) = deadline else {
+                return Ok(());
+            };
+            if deadline <= tokio::time::Instant::now() {
+                return Err(TransportFault::new(
+                    "control_response",
+                    role,
+                    format!(
+                        "request {} deadline; remote outcome unknown",
+                        response.request_id
+                    ),
+                ));
+            }
             let (view, member) = match response.body {
                 ResponseBody::RoomCreated { member_id, view }
                 | ResponseBody::RoomJoined { member_id, view } => (view, member_id),
@@ -2581,7 +2876,7 @@ fn apply_room_view(
     local_member: MemberId,
     state: &Mutex<MasterBridgeState>,
     facts: &Mutex<Vec<MasterLifecycleFact>>,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: &ControlSender,
     request_id: &mut u64,
     bootstrap: &BootstrapLane,
     session: &mut SessionCore,
@@ -2631,6 +2926,29 @@ fn apply_room_view(
         )?;
         *started_epoch = view.epoch;
     }
+    if is_host && view.phase.in_match() {
+        let applied = apply_host(
+            host_match,
+            HostMatchEvent::PeerRoster {
+                match_key: identity.match_key(),
+                members: view
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|member| *member != local_member)
+                    .collect(),
+                now_ms: now_ms(),
+            },
+        );
+        execute_host_match_effects(
+            applied.effects,
+            map_ready,
+            facts,
+            control_tx,
+            request_id,
+            role,
+        )?;
+    }
     if is_host && !view.phase.in_match() && *started_epoch != 0 {
         let applied = apply_host(
             host_match,
@@ -2665,7 +2983,7 @@ fn apply_room_view(
 fn apply_peer_event(
     event: master_protocol::PeerEvent,
     facts: &Mutex<Vec<MasterLifecycleFact>>,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: &ControlSender,
     request_id: &mut u64,
     session: &mut SessionCore,
     host_match: &mut HostMatchCore,
@@ -2815,9 +3133,22 @@ fn apply_peer_event(
     Ok(())
 }
 
+struct BootstrapSender {
+    tx: tokio::sync::mpsc::Sender<BootstrapJob>,
+    bytes: Arc<tokio::sync::Semaphore>,
+}
+
+struct BootstrapJob {
+    _bytes: tokio::sync::OwnedSemaphorePermit,
+    match_key: frame::MatchKey,
+    member: MemberId,
+    bytes: Vec<u8>,
+    deadline: tokio::time::Instant,
+}
+
 fn enqueue_bootstrap_job(
     match_key: frame::MatchKey,
-    jobs: &tokio::sync::mpsc::Sender<(frame::MatchKey, MemberId, Vec<u8>)>,
+    jobs: &BootstrapSender,
     member: MemberId,
     bytes: Vec<u8>,
     role: &'static str,
@@ -2826,7 +3157,24 @@ fn enqueue_bootstrap_job(
     {
         return Ok(());
     }
-    classify_try_send(jobs.try_send((match_key, member, bytes)), "bootstrap_job").map_err(|loss| {
+    let permit = jobs
+        .bytes
+        .clone()
+        .try_acquire_many_owned(bytes.len() as u32)
+        .map_err(|_| {
+            TransportFault::new("bootstrap_job", role, "bootstrap byte budget exhausted")
+        })?;
+    classify_try_send(
+        jobs.tx.try_send(BootstrapJob {
+            _bytes: permit,
+            match_key,
+            member,
+            bytes,
+            deadline: tokio::time::Instant::now() + limits::values().queue_age,
+        }),
+        "bootstrap_job",
+    )
+    .map_err(|loss| {
         TransportFault::new(
             match loss {
                 QueueLoss::Full { operation } | QueueLoss::Closed { operation } => operation,
@@ -2840,13 +3188,16 @@ fn enqueue_bootstrap_job(
 fn pump_local_queues(
     match_key: frame::MatchKey,
     bootstrap: &BootstrapLane,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
-    jobs: &tokio::sync::mpsc::Sender<(frame::MatchKey, MemberId, Vec<u8>)>,
+    control_tx: &ControlSender,
+    jobs: &BootstrapSender,
     role: &'static str,
     is_host: bool,
     request_id: &mut u64,
     map_ready: &Mutex<HashSet<MemberId>>,
 ) -> std::result::Result<(), TransportFault> {
+    bootstrap
+        .check_deadline()
+        .map_err(|error| TransportFault::new("bootstrap_queue", role, error))?;
     for (peer, bytes) in bootstrap.take_to_worker() {
         if is_host {
             let Some(member) = peer else {
@@ -2904,7 +3255,7 @@ fn pump_local_queues(
 
 async fn bootstrap_egress(
     connection: quinn::Connection,
-    mut jobs: tokio::sync::mpsc::Receiver<(frame::MatchKey, MemberId, Vec<u8>)>,
+    mut jobs: tokio::sync::mpsc::Receiver<BootstrapJob>,
     prepared: tokio::sync::mpsc::Sender<HostMatchEvent>,
     cancel: CancellationToken,
     role: &'static str,
@@ -2913,9 +3264,10 @@ async fn bootstrap_egress(
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
             job = jobs.recv() => {
-                let Some((match_key, member, bytes)) = job else {
+                let Some(BootstrapJob { match_key, member, bytes, deadline, _bytes }) = job else {
                     return Ok(());
                 };
+                if deadline <= tokio::time::Instant::now() { return Err(TransportFault::new("bootstrap_job", role, "bootstrap queue deadline")); }
                 send_bootstrap_stream(&connection, member, &bytes, &cancel, role).await?;
                 if let Ok(Some(BootstrapMessage::Offer {
                     bootstrap_id,
@@ -2956,7 +3308,7 @@ async fn datagram_ingress(
     role: &'static str,
     is_host: bool,
 ) -> std::result::Result<(), TransportFault> {
-    let mut reassemblers: HashMap<MemberId, Reassembler> = HashMap::new();
+    let mut reassemblers: HashMap<MemberId, (Reassembler, Instant)> = HashMap::new();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
@@ -2991,7 +3343,15 @@ async fn datagram_ingress(
                         continue;
                     }
                 };
-                let reassembler = reassemblers.entry(member).or_insert_with(relay_reassembler);
+                let now = Instant::now();
+                reassemblers.retain(|_, (_, seen)| now.duration_since(*seen) < limits::values().queue_age);
+                if !reassemblers.contains_key(&member)
+                    && reassemblers.len() >= master_protocol::MAX_SESSION_MEMBERS as usize
+                {
+                    continue;
+                }
+                let (reassembler, seen) = reassemblers.entry(member).or_insert_with(|| (relay_reassembler(), now));
+                *seen = now;
                 match reassembler.push(payload) {
                     Ok(Some(packet)) => {
                         if mailbox.push_inbound(member, packet) {
@@ -3031,7 +3391,12 @@ async fn uni_ingress(
                 };
                 let bytes = tokio::select! {
                     _ = cancel.cancelled() => return Ok(()),
-                    read = recv.read_to_end(MAX_BOOTSTRAP_STREAM_BYTES) => match read {
+                    read = tokio::time::timeout(limits::values().transfer, read_transfer(&mut recv)) => match read {
+                        Err(_) => {
+                            let _ = recv.stop(0_u8.into());
+                            return Err(TransportFault::new("bootstrap_uni_read", role, "bootstrap transfer deadline"));
+                        }
+                        Ok(read) => match read {
                         Ok(bytes) => bytes,
                         Err(error) => {
                             return Err(TransportFault::with_connection(
@@ -3041,6 +3406,7 @@ async fn uni_ingress(
                                 &connection,
                             ));
                         }
+                        },
                     },
                 };
                 match decode_relay_stream(&bytes) {
@@ -3081,7 +3447,7 @@ async fn gameplay_egress(
     let mut fragmenter = relay_fragmenter();
     // Quinn reserves bookkeeping space even for an empty datagram buffer.
     let empty_buffer_space = connection.datagram_send_buffer_space();
-    let mut pending: VecDeque<(MemberId, Vec<u8>)> = VecDeque::new();
+    let mut pending: VecDeque<(MemberId, Vec<u8>, tokio::time::Instant)> = VecDeque::new();
     let mut tick = tokio::time::interval(QUEUE_POLL);
     let mut sampled = tokio::time::Instant::now();
     loop {
@@ -3104,13 +3470,19 @@ async fn gameplay_egress(
                     // Gameplay packets carry the newest input/snapshot plus
                     // unacknowledged reliable rows. Replace unsent older state
                     // for this peer rather than building a latency backlog.
-                    if let Some((_, previous)) = pending.iter_mut().find(|(id, _)| *id == member) {
+                    if let Some((_, previous, _)) = pending.iter_mut().find(|(id, _, _)| *id == member) {
                         *previous = packet;
                     } else {
-                        pending.push_back((member, packet));
+                        if pending.len() >= master_protocol::MAX_SESSION_MEMBERS as usize {
+                            return Err(TransportFault::new("send_datagram", role, "pending peer budget exhausted"));
+                        }
+                        pending.push_back((member, packet, tokio::time::Instant::now() + limits::values().queue_age));
                     }
                 }
-                while let Some((member, packet)) = pending.front() {
+                while let Some((member, packet, deadline)) = pending.front() {
+                    if *deadline <= tokio::time::Instant::now() {
+                        return Err(TransportFault::new("send_datagram", role, "gameplay queue deadline"));
+                    }
                     let fragments = match fragmenter.split(packet) {
                         Ok(fragments) => fragments,
                         Err(error) => {
@@ -3200,14 +3572,56 @@ async fn send_bootstrap_stream(
     send.set_priority(BOOTSTRAP_PRIORITY).map_err(|error| {
         TransportFault::with_connection("bootstrap_priority", role, error, connection)
     })?;
-    cancellable(cancel, send.write_all(&bytes))
+    let result = tokio::select! {
+        _ = cancel.cancelled() => Err("session canceled".into()),
+        result = tokio::time::timeout(limits::values().transfer, write_transfer(&mut send, &bytes)) =>
+            result.map_err(|_| Error::from("transfer total deadline")).and_then(|result| result),
+    };
+    if result.is_err() {
+        let _ = send.reset(0_u8.into());
+    }
+    result.map_err(|error| {
+        TransportFault::with_connection("bootstrap_uni_write", role, error, connection)
+    })
+}
+
+async fn read_transfer(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk =
+            tokio::time::timeout(limits::values().progress, recv.read_chunk(16 * 1024, true))
+                .await
+                .map_err(|_| "transfer progress deadline")??;
+        let Some(chunk) = chunk else {
+            return Ok(bytes);
+        };
+        if chunk.bytes.is_empty() || bytes.len() + chunk.bytes.len() > MAX_BOOTSTRAP_STREAM_BYTES {
+            return Err("transfer byte budget exceeded".into());
+        }
+        bytes.extend_from_slice(&chunk.bytes);
+    }
+}
+
+async fn write_transfer(send: &mut quinn::SendStream, bytes: &[u8]) -> Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + 16 * 1024).min(bytes.len());
+        let written =
+            tokio::time::timeout(limits::values().progress, send.write(&bytes[offset..end]))
+                .await
+                .map_err(|_| "transfer progress deadline")??;
+        if written == 0 {
+            return Err("transfer made no progress".into());
+        }
+        offset += written;
+    }
+    send.finish()?;
+    if let Some(code) = tokio::time::timeout(limits::values().progress, send.stopped())
         .await
-        .map_err(|error| {
-            TransportFault::with_connection("bootstrap_uni_write", role, error, connection)
-        })?;
-    send.finish().map_err(|error| {
-        TransportFault::with_connection("bootstrap_uni_finish", role, error, connection)
-    })?;
+        .map_err(|_| "transfer acknowledgement deadline")??
+    {
+        return Err(format!("transfer refused with code {code}").into());
+    }
     Ok(())
 }
 
@@ -3228,7 +3642,12 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> Result<ControlFrame> {
 }
 
 async fn write_frame(send: &mut quinn::SendStream, frame: &ControlFrame) -> Result<()> {
-    send.write_all(&encode_stream_frame(frame)?).await?;
+    tokio::time::timeout(
+        limits::values().response,
+        send.write_all(&encode_stream_frame(frame)?),
+    )
+    .await
+    .map_err(|_| "control write deadline")??;
     Ok(())
 }
 
@@ -3238,7 +3657,9 @@ async fn cancellable<T>(
 ) -> Result<T> {
     tokio::select! {
         _ = cancel.cancelled() => Err("session cancelled".into()),
-        result = fut => result.map_err(Into::into),
+        result = tokio::time::timeout(limits::values().response, fut) => {
+            result.map_err(|_| "operation deadline")?.map_err(Into::into)
+        },
     }
 }
 
@@ -3271,9 +3692,6 @@ fn client_config(target: &MasterTarget) -> Result<quinn::ClientConfig> {
     transport.keep_alive_interval(Some(CLIENT_KEEP_ALIVE));
     transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     transport.max_concurrent_uni_streams(MAX_RELAY_UNI_STREAMS.into());
-    transport.congestion_controller_factory(Arc::new(
-        master_protocol::congestion::StallTolerantConfig::default(),
-    ));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
 }
@@ -3282,10 +3700,17 @@ async fn connect(
     target: &MasterTarget,
     cancel: &CancellationToken,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
-    let address = dns_timeout(cancel, tokio::net::lookup_host(target.address.as_str()))
-        .await?
-        .next()
-        .ok_or_else(|| format!("{} resolved no addresses", target.address))?;
+    limits::configured()?;
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + limits::values().connect;
+    let address = tokio::time::timeout_at(
+        deadline,
+        dns_timeout(cancel, tokio::net::lookup_host(target.address.as_str())),
+    )
+    .await
+    .map_err(|_| "connection deadline during address lookup")??
+    .next()
+    .ok_or_else(|| format!("{} resolved no addresses", target.address))?;
     let client_config = client_config(target)?;
     let bind: std::net::SocketAddr = if address.is_ipv4() {
         "0.0.0.0:0"
@@ -3293,8 +3718,6 @@ async fn connect(
         "[::]:0"
     }
     .parse()?;
-    let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + CONNECT_BUDGET;
     let mut attempts = tokio::task::JoinSet::new();
     let mut in_flight = VecDeque::new();
     let mut next_attempt = tokio::time::Instant::now();

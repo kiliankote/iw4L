@@ -222,7 +222,7 @@ fn install_class_catalog(
         if key.contains('+')
             && asset_core::AssetKey::parse(key)
                 .is_ok_and(|key| key.namespace == asset_core::AssetNamespace::Iw4)
-            && menus.material_images.contains_key(&preview.image)
+            && menus.material_images().contains_key(&preview.image)
         {
             preview.image = format!("iw4:material/{}", preview.image);
         }
@@ -735,6 +735,7 @@ fn run_map(
         .insert_resource(cheats)
         .insert_resource(probe)
         .insert_resource(menus)
+        .insert_resource(assets::CurrentMatchLoad(Some(Default::default())))
         .insert_resource(MatchLoadRequest {
             request_id: 0,
             load_key: Default::default(),

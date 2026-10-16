@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod limits;
+
 mod updates;
 
 use std::collections::HashMap;
@@ -22,20 +24,53 @@ use master_protocol::{
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_platform_verifier::ConfigVerifierExt;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, Semaphore};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
 const MAX_ROOMS: usize = 10_000;
-const CONTROL_CAP: usize = 32;
 const CONTROL_PRIORITY: i32 = 0;
+
+struct QueuedControl {
+    frame: ControlFrame,
+    deadline: tokio::time::Instant,
+    _bytes: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+struct ControlSender {
+    tx: tokio::sync::mpsc::Sender<QueuedControl>,
+    bytes: Arc<Semaphore>,
+}
+
+impl ControlSender {
+    fn try_send(&self, frame: ControlFrame) -> Result<()> {
+        let len = encode_stream_frame(&frame)?.len();
+        let bytes = self
+            .bytes
+            .clone()
+            .try_acquire_many_owned(len as u32)
+            .map_err(|_| "control byte budget exhausted")?;
+        self.tx
+            .try_send(QueuedControl::new(frame, bytes))
+            .map_err(|_| "control queue exhausted")?;
+        Ok(())
+    }
+}
+
+impl QueuedControl {
+    fn new(frame: ControlFrame, bytes: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            frame,
+            deadline: tokio::time::Instant::now() + limits::values().queue_age,
+            _bytes: bytes,
+        }
+    }
+}
 
 const BOOTSTRAP_PRIORITY: i32 = -32;
 const CLI_DEADLINE: Duration = Duration::from_secs(8);
-const BOOTSTRAP_FORWARD: Duration = SESSION_IDLE;
-const HELLO_DEADLINE: Duration = Duration::from_secs(20);
 const MAX_CONNECTIONS: usize = 256;
 /// A household or a LAN party shares one address.
 const MAX_CONNECTIONS_PER_ADDRESS: usize = 32;
@@ -122,7 +157,7 @@ struct Peer {
     online: Option<Instant>,
     player_name: String,
     connection: quinn::Connection,
-    control_tx: tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: ControlSender,
 }
 
 struct PasswordVerifier {
@@ -184,7 +219,7 @@ impl ServiceState {
         connection_id: u64,
         player_name: String,
         connection: quinn::Connection,
-        control_tx: tokio::sync::mpsc::Sender<ControlFrame>,
+        control_tx: ControlSender,
     ) {
         self.peers.insert(
             connection_id,
@@ -395,6 +430,7 @@ impl ServiceState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    limits::configured()?;
     match parse_args()? {
         Command::Serve {
             bind,
@@ -549,9 +585,6 @@ async fn serve(bind: SocketAddr, cert_path: &Path, key_path: &Path) -> Result<()
     transport.keep_alive_interval(Some(SESSION_KEEP_ALIVE));
     transport.datagram_receive_buffer_size(Some(128 * 1024));
     transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
-    transport.congestion_controller_factory(Arc::new(
-        master_protocol::congestion::StallTolerantConfig::default(),
-    ));
 
     let endpoint = quinn::Endpoint::server(config, bind)?;
     let state = Arc::new(Mutex::new(ServiceState::default()));
@@ -660,11 +693,11 @@ async fn run_connection(
     connection_id: u64,
     connection: quinn::Connection,
 ) -> Result<()> {
-    let (mut send, recv) = tokio::time::timeout(HELLO_DEADLINE, connection.accept_bi())
+    let (mut send, recv) = tokio::time::timeout(limits::values().response, connection.accept_bi())
         .await
         .map_err(|_| "hello deadline (accept_bi)")??;
     send.set_priority(CONTROL_PRIORITY)?;
-    let (recv, hello) = tokio::time::timeout(HELLO_DEADLINE, read_owned_frame(recv))
+    let (recv, hello) = tokio::time::timeout(limits::values().response, read_owned_frame(recv))
         .await
         .map_err(|_| "hello deadline (first frame)")?;
     let hello = hello?;
@@ -679,7 +712,12 @@ async fn run_connection(
         hello.game_protocol,
         hello.build
     );
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlFrame>(CONTROL_CAP);
+    let (tx, mut control_rx) =
+        tokio::sync::mpsc::channel::<QueuedControl>(limits::values().queue_items);
+    let control_tx = ControlSender {
+        tx,
+        bytes: Arc::new(Semaphore::new(limits::values().queue_bytes)),
+    };
     state.lock().await.attach_peer(
         connection_id,
         normalize_player_name(&hello.player_name),
@@ -691,7 +729,9 @@ async fn run_connection(
     children.spawn(async move {
         let result = async {
             while let Some(frame) = control_rx.recv().await {
-                write_frame(&mut send, &frame).await?;
+                tokio::time::timeout_at(frame.deadline, write_frame(&mut send, &frame.frame))
+                    .await
+                    .map_err(|_| "control queue/write deadline")??;
             }
             Result::<()>::Ok(())
         }
@@ -782,7 +822,7 @@ async fn dispatch_publishes(state: &Mutex<ServiceState>, publishes: Vec<(u64, Co
             };
             match peer.control_tx.try_send(frame) {
                 Ok(()) => {}
-                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                Err(_) => {
                     failed.push(connection_id);
                     peer.connection
                         .close(0_u8.into(), b"control delivery failed");
@@ -1363,8 +1403,8 @@ async fn bootstrap_forward(
     mut recv: quinn::RecvStream,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> ConnTask {
-    let result = tokio::time::timeout(BOOTSTRAP_FORWARD, async {
-        let bytes = recv.read_to_end(MAX_BOOTSTRAP_STREAM_BYTES).await?;
+    let result = tokio::time::timeout(limits::values().transfer, async {
+        let bytes = read_transfer(&mut recv).await?;
         let relay = decode_relay_stream(&bytes)?;
         let (target, outgoing) = {
             let current = state.lock().await;
@@ -1372,11 +1412,17 @@ async fn bootstrap_forward(
         };
         let mut send = target.open_uni().await?;
         send.set_priority(BOOTSTRAP_PRIORITY)?;
-        send.write_all(&outgoing).await?;
-        send.finish()?;
+        let result = write_transfer(&mut send, &outgoing).await;
+        if result.is_err() {
+            let _ = send.reset(0_u8.into());
+        }
+        result?;
         Result::<()>::Ok(())
     })
     .await;
+    if !matches!(result, Ok(Ok(()))) {
+        let _ = recv.stop(0_u8.into());
+    }
     match result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -1583,6 +1629,46 @@ async fn rpc(
             }
         }
     }
+}
+
+async fn read_transfer(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk =
+            tokio::time::timeout(limits::values().progress, recv.read_chunk(16 * 1024, true))
+                .await
+                .map_err(|_| "transfer progress deadline")??;
+        let Some(chunk) = chunk else {
+            return Ok(bytes);
+        };
+        if chunk.bytes.is_empty() || bytes.len() + chunk.bytes.len() > MAX_BOOTSTRAP_STREAM_BYTES {
+            return Err("transfer byte budget exceeded".into());
+        }
+        bytes.extend_from_slice(&chunk.bytes);
+    }
+}
+
+async fn write_transfer(send: &mut quinn::SendStream, bytes: &[u8]) -> Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + 16 * 1024).min(bytes.len());
+        let written =
+            tokio::time::timeout(limits::values().progress, send.write(&bytes[offset..end]))
+                .await
+                .map_err(|_| "transfer progress deadline")??;
+        if written == 0 {
+            return Err("transfer made no progress".into());
+        }
+        offset += written;
+    }
+    send.finish()?;
+    if let Some(code) = tokio::time::timeout(limits::values().progress, send.stopped())
+        .await
+        .map_err(|_| "transfer acknowledgement deadline")??
+    {
+        return Err(format!("transfer refused with code {code}").into());
+    }
+    Ok(())
 }
 
 async fn read_owned_frame(

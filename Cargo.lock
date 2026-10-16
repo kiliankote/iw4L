@@ -4317,9 +4317,6 @@ dependencies = [
 [[package]]
 name = "master_protocol"
 version = "0.1.0"
-dependencies = [
- "quinn-proto",
-]
 
 [[package]]
 name = "matchers"
@@ -5679,6 +5676,7 @@ dependencies = [
  "hud_iw4",
  "lighting_iw4",
  "marks_iw4",
+ "master_protocol",
  "math_iw4",
  "naga",
  "net",
@@ -5747,6 +5745,7 @@ dependencies = [
  "render_backend",
  "render_frame",
  "render_material",
+ "render_scene",
 ]
 
 [[package]]

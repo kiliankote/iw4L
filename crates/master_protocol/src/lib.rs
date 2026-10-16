@@ -2,7 +2,7 @@
 
 use core::{fmt, str::FromStr};
 
-pub mod congestion;
+pub mod budget;
 
 pub const PROTOCOL_VERSION: u16 = 10;
 pub const ALPN: &[u8] = b"iw4l-master/10";

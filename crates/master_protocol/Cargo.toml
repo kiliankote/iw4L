@@ -7,6 +7,3 @@ description = "Versioned control and opaque relay protocol shared by iw4l and iw
 
 [lints]
 workspace = true
-
-[dependencies]
-quinn-proto = { version = "0.11.17", default-features = false }
